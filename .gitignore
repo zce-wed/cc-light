@@ -1,0 +1,13 @@
+# 运行时状态(每台机器不同,不提交)
+sessions/
+config.json
+pos.json
+state.json
+hook-miss.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 备份
+*.bak
