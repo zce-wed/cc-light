@@ -400,41 +400,80 @@ def run_gui():
     cv.bind("<B1-Motion>", move)
     cv.bind("<ButtonRelease-1>", lambda e: save_pos())
     cv.bind("<Double-Button-1>", lambda e: root.attributes("-topmost", not root.attributes("-topmost")))
+    cv.bind("<Enter>", lambda e: details_hover())
+    cv.bind("<Leave>", lambda e: schedule_close())
 
     # ---- 会话明细 ----
-    def show_details():
+    detail_win = [None]
+    close_timer = [None]
+
+    def cancel_close():
+        if close_timer[0]:
+            root.after_cancel(close_timer[0])
+            close_timer[0] = None
+
+    def close_details():
+        cancel_close()
+        if detail_win[0] is not None:
+            try:
+                detail_win[0].destroy()
+            except Exception:
+                pass
+            detail_win[0] = None
+
+    def schedule_close():
+        cancel_close()
+        close_timer[0] = root.after(300, close_details)
+
+    def details_hover():
+        cancel_close()
+        if detail_win[0] is not None:
+            try:
+                detail_win[0].destroy()
+            except Exception:
+                pass
         sessions = read_sessions()
         now = time.time()
         win = tk.Toplevel(root)
-        win.title("cc-light 会话明细")
+        win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.configure(bg=BG)
+        detail_win[0] = win
         order = sorted(sessions.items(),
                        key=lambda kv: (PRIO.get(effective_state(kv[1], now), 99), -kv[1].get("ts", 0)))
         names = [d.get("name", "") for _, d in sessions.items()]
-        tk.Label(win, text="  会话明细(按优先级)", fg="#bbbbbb", bg=BG,
-                 font=("Microsoft YaHei", 10, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+        tk.Label(win, text=" 会话明细(悬停查看,移开关闭)", fg="#9a9a9a", bg=BG,
+                 font=("Microsoft YaHei", 8)).grid(row=0, column=0, sticky="w", padx=6, pady=(4, 2))
         if not order:
-            tk.Label(win, text="  (无活跃会话)", fg="#888888", bg=BG,
-                     font=("Microsoft YaHei", 9)).grid(row=1, column=0, sticky="w", padx=6, pady=2)
+            tk.Label(win, text=" (无活跃会话)", fg="#888888", bg=BG,
+                     font=("Microsoft YaHei", 8)).grid(row=1, column=0, sticky="w", padx=6, pady=2)
         for i, (sid, d) in enumerate(order, start=1):
             raw = d.get("state", "gray")
             st = effective_state(d, now)
-            stale = (raw == "yellow" and st == "green")   # 超时降级的,标注
+            stale = (raw == "yellow" and st == "green")
             color = COLORS.get(st, {}).get("on", "#666666")
             name = d.get("name") or sid[:8]
             if names.count(d.get("name", "")) > 1:
                 name = name + " " + sid[:4]
             row = tk.Frame(win, bg=BG)
             row.grid(row=i, column=0, sticky="w", padx=6, pady=1)
-            tk.Label(row, text="●", fg=color, bg=BG, font=("Consolas", 11)).pack(side="left")
+            tk.Label(row, text="●", fg=color, bg=BG, font=("Consolas", 10)).pack(side="left")
             word = STATE_WORD.get(st, "") + (" ·超时" if stale else "")
             tk.Label(row, text=" " + word, fg=color, bg=BG,
-                     font=("Microsoft YaHei", 9, "bold")).pack(side="left")
+                     font=("Microsoft YaHei", 8, "bold")).pack(side="left")
             tk.Label(row, text="  " + name, fg="#dddddd", bg=BG,
-                     font=("Microsoft YaHei", 9)).pack(side="left")
+                     font=("Microsoft YaHei", 8)).pack(side="left")
             tk.Label(row, text="  " + human_ago(d.get("ts", 0)), fg="#777777", bg=BG,
-                     font=("Consolas", 8)).pack(side="left")
+                     font=("Consolas", 7)).pack(side="left")
+        win.update_idletasks()
+        x = root.winfo_rootx() + W + 4
+        y = root.winfo_rooty()
+        sw = root.winfo_screenwidth()
+        if x + win.winfo_reqwidth() > sw:
+            x = root.winfo_rootx() - win.winfo_reqwidth() - 4
+        win.geometry("+%d+%d" % (x, y))
+        win.bind("<Enter>", lambda e: cancel_close())
+        win.bind("<Leave>", lambda e: schedule_close())
 
     def cleanup_stale():
         """删超过超时阈值无更新的会话(关窗口没触发 SessionEnd 的残留)"""
@@ -464,7 +503,6 @@ def run_gui():
         timeout_menu.add_radiobutton(label="%d 秒" % sec, value=sec, variable=timeout_var, command=on_set_timeout)
 
     menu = tk.Menu(root, tearoff=0)
-    menu.add_command(label="会话明细…", command=show_details)
     menu.add_command(label="清理不活跃会话", command=cleanup_stale)
     menu.add_separator()
     menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
