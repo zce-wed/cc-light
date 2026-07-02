@@ -42,10 +42,11 @@ MARKER = "cc-light/"   # 通用前缀:既能 strip 旧 pythonw 版,也能 strip 
 #  - 不挂 PreToolUse。曾挂它(async)写入迟于 Stop、覆盖绿灯,导致会话结束后灯一直闪黄。
 #  - SessionEnd 用 --end 删该会话文件,避免已关闭窗口状态残留(失败靠 6h 过期清理兜底)。
 INJECT = {
-    "SessionStart":      ("yellow", "*", False),
+    "SessionStart":      ("green",  "*", False),   # 新会话就绪=空闲,不是"运行中"
     "UserPromptSubmit":  ("yellow", "*", False),
     "Stop":              ("green",  "*", False),
     "PermissionRequest": ("red",    "*", False),
+    "PostToolUse":       ("yellow", "AskUserQuestion|ExitPlanMode", False),  # 决策类工具完成后 → 黄(恢复运行中,不拖慢日常工具)
     "Notification":      ("green",  "idle_prompt", False),  # 答完/中断后等你 → 绿(Stop 不触发用户中断)
     "SessionEnd":        ("end",    "*", False),
 }

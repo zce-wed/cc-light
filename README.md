@@ -9,8 +9,8 @@
 | 灯色 | 含义 | 触发事件 |
 |------|------|---------|
 | 🔴 红 | 弹出权限确认框 | `PermissionRequest` |
-| 🟡 黄 | 运行中(呼吸) | `SessionStart` / `UserPromptSubmit` |
-| 🟢 绿 | 完成 / 空闲 | `Stop` / `Notification(idle_prompt)` |
+| 🟡 黄 | 运行中(呼吸) | `UserPromptSubmit` / `PostToolUse`(决策类工具完成) |
+| 🟢 绿 | 完成 / 空闲 / 就绪 | `SessionStart` / `Stop` / `Notification(idle_prompt)` |
 | ⚫ 全暗 | 无活跃会话 | — |
 
 > 用户中断不触发 `Stop`(CC 官方设计),靠 `Notification(idle_prompt)` 兜底变绿,再加超时降级双保险。
@@ -81,6 +81,8 @@ python install-hooks.py uninstall   # 移除 hooks(自动备份)
 - **超时降级 + idle_prompt**:双保险,防「中断 / Stop 丢失」卡黄。
 - **过期清理**:session 文件 1h 无更新删除。
 - **红用 `PermissionRequest` 不用 `Notification`**(`Notification` 含 `idle_prompt` 会误亮红;`idle_prompt` 单独用于 → 绿)。
+- **决策后回黄**:`PostToolUse` 只匹配 `AskUserQuestion`/`ExitPlanMode`,决策完成即刷黄(否则会卡红直到 Stop);日常工具不触发、零拖慢。
+- **状态识别非 100%**:CC 不给「中断」事件、长思考无事件与中断不可区分,故保留超时兜底(右键可调/可关)。
 - **`start-light.vbs` 必须纯 ASCII**:VBScript 在中文系统按 GBK 解析,UTF-8 中文注释会报「缺少对象」。
 
 ## 平台
