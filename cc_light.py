@@ -362,7 +362,7 @@ def run_gui():
         n = len(items)
         gap = 2.5
         avail = W - 2 * PAD - 2
-        r = min(3.5, max(2.0, (avail - (n - 1) * gap) / (2 * n)))   # 点多则自动缩小
+        r = min(3.0, max(1.8, (avail - (n - 1) * gap) / (2.5 * n)))   # 点多则更小,5个不挤
         total = n * 2 * r + (n - 1) * gap
         x = (W - total) / 2 + r
         y = 126
@@ -466,11 +466,18 @@ def run_gui():
             tk.Label(row, text="  " + human_ago(d.get("ts", 0)), fg="#777777", bg=BG,
                      font=("Consolas", 7)).pack(side="left")
         win.update_idletasks()
-        x = root.winfo_rootx() + W + 4
-        y = root.winfo_rooty()
+        ww = win.winfo_reqwidth()
+        wh = win.winfo_reqheight()
         sw = root.winfo_screenwidth()
-        if x + win.winfo_reqwidth() > sw:
-            x = root.winfo_rootx() - win.winfo_reqwidth() - 4
+        sh = root.winfo_screenheight()
+        x = root.winfo_rootx() + W + 4
+        if x + ww > sw:
+            x = root.winfo_rootx() - ww - 4
+        y = root.winfo_rooty()
+        if y + wh > sh - 4:            # 超屏底 → 向上展开(底部对齐灯底)
+            y = root.winfo_rooty() + H - wh
+        if y < 0:
+            y = 0
         win.geometry("+%d+%d" % (x, y))
         win.bind("<Enter>", lambda e: cancel_close())
         win.bind("<Leave>", lambda e: schedule_close())
@@ -512,8 +519,17 @@ def run_gui():
     menu.add_command(label="手动 · 黄(运行中)", command=lambda: write_session("_manual", "yellow", "", "手动"))
     menu.add_command(label="手动 · 绿(完成)",   command=lambda: write_session("_manual", "green", "", "手动"))
     menu.add_command(label="手动 · 清除",       command=lambda: delete_session("_manual"))
+    def restart():
+        import subprocess
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+        except Exception:
+            pass
+        root.destroy()
+
     menu.add_separator()
     menu.add_command(label="复位位置", command=lambda: root.geometry(default_geo()))
+    menu.add_command(label="重启", command=restart)
     menu.add_command(label="退出", command=root.destroy)
     cv.bind("<ButtonPress-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
 
