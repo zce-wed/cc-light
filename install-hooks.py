@@ -48,6 +48,8 @@ INJECT = {
     "PermissionRequest": ("red",    "*", False),
     "PostToolUse":       ("yellow", "AskUserQuestion|ExitPlanMode", False),  # 决策类工具完成后 → 黄(恢复运行中,不拖慢日常工具)
     "Notification":      ("green",  "idle_prompt", False),  # 答完/中断后等你 → 绿(Stop 不触发用户中断)
+    "SubagentStart":     ("sub_start", "*", False),  # 子 agent 启动 → 黄 + subs+1(多层执行在跑)
+    "SubagentStop":      ("sub_stop",  "*", False),  # 子 agent 完成 → subs-1(不改色,主可能继续派下一个)
     "SessionEnd":        ("end",    "*", False),
 }
 

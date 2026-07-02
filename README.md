@@ -83,6 +83,7 @@ python install-hooks.py uninstall   # 移除 hooks(自动备份)
 - **红用 `PermissionRequest` 不用 `Notification`**(`Notification` 含 `idle_prompt` 会误亮红;`idle_prompt` 单独用于 → 绿)。
 - **决策后回黄**:`PostToolUse` 只匹配 `AskUserQuestion`/`ExitPlanMode`,决策完成即刷黄(否则会卡红直到 Stop);日常工具不触发、零拖慢。
 - **状态识别非 100%**:CC 不给「中断」事件、长思考无事件与中断不可区分,故保留超时兜底(右键可调/可关)。
+- **多层执行(子 agent)**:挂 `SubagentStart`/`SubagentStop`,每个 session 维护 `subs` 计数;子 agent 跑期间主 `Stop`/`idle_prompt` 不写 green(保持 yellow),避免「子还在跑却绿灯」。`hook.js` 从只写改为先读后写(合并 `subs`)。
 - **`start-light.vbs` 必须纯 ASCII**:VBScript 在中文系统按 GBK 解析,UTF-8 中文注释会报「缺少对象」。
 
 ## 平台
