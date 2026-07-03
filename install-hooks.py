@@ -78,7 +78,7 @@ def find_node():
 HOOK_JS = os.path.join(DIR, "hook.js").replace("\\", "/")
 
 
-def entry(node, action, matcher="*", timeout=5, async_=False):
+def entry(node, action, matcher="*", timeout=10, async_=False):
     if action == "end":
         cmd = '"%s" "%s" end' % (node, HOOK_JS)
     else:

@@ -1,0 +1,16 @@
+{
+  "name": "cc-light-helper",
+  "displayName": "cc-light Helper",
+  "description": "配合 cc-light 悬浮灯:点击会话时按 shell PID 精确切换到对应终端(解决同窗口多终端无法区分)。",
+  "version": "0.0.1",
+  "publisher": "cc-light",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onUri", "onCommand:cc-light-helper.diag"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "cc-light-helper.diag", "title": "cc-light: 列出终端 PID(诊断)" }
+    ]
+  }
+}

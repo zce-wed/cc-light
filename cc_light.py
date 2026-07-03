@@ -163,7 +163,7 @@ def _self_entry(action, matcher):
         cmd = '"%s" "%s" end' % (node, HOOK_JS_SELF)
     else:
         cmd = '"%s" "%s" %s' % (node, HOOK_JS_SELF, action)
-    return {"matcher": matcher, "hooks": [{"type": "command", "command": cmd, "timeout": 5}]}
+    return {"matcher": matcher, "hooks": [{"type": "command", "command": cmd, "timeout": 10}]}
 
 
 def ensure_hooks():
@@ -294,6 +294,29 @@ def work_area():
         return r.left, r.top, r.right, r.bottom
     except Exception:
         return None
+
+
+def focus_window(hwnd):
+    """把指定 HWND 的窗口恢复+前置(点击会话名跳转到对应终端)。"""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        hwnd = int(hwnd)
+        if not hwnd or not u.IsWindow(hwnd):
+            return False
+        if u.IsIconic(hwnd):                # 最小化则恢复
+            u.ShowWindow(hwnd, 9)           # SW_RESTORE
+        cur = u.GetWindowThreadProcessId(u.GetForegroundWindow(), 0)
+        tgt = u.GetWindowThreadProcessId(hwnd, 0)
+        if cur and tgt and cur != tgt:      # AttachThreadInput 绕过 SetForegroundWindow 前台限制
+            u.AttachThreadInput(cur, tgt, True)
+            u.SetForegroundWindow(hwnd)
+            u.AttachThreadInput(cur, tgt, False)
+        else:
+            u.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
 
 
 def round_rect(cv, x0, y0, x1, y1, r, **kw):
@@ -498,6 +521,12 @@ def run_gui():
                 pass
         sessions = read_sessions()
         now = time.time()
+        # 统计每个 hwnd 被几个会话共享(同窗口多终端 = 共享 hwnd,需要 termpid 区分)
+        hwnd_count = {}
+        for _s in sessions.values():
+            _hh = _s.get("hwnd")
+            if _hh:
+                hwnd_count[_hh] = hwnd_count.get(_hh, 0) + 1
         win = tk.Toplevel(root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
@@ -529,6 +558,23 @@ def run_gui():
                      font=("Microsoft YaHei", 8)).pack(side="left")
             tk.Label(row, text="  " + human_ago(d.get("ts", 0)), fg="#777777", bg=BG,
                      font=("Consolas", 7)).pack(side="left")
+            hwnd = d.get("hwnd")
+            termpid = d.get("termpid")
+            if hwnd or termpid:
+                def _jump(e, h=hwnd, tp=termpid, shared=hwnd_count.get(hwnd, 0) > 1):
+                    if h:
+                        focus_window(h)               # 先聚焦宿主窗口(总是做,恢复原能力)
+                    if tp and shared:                 # 同窗口多终端 → 额外发 URI 精确切到对应终端
+                        try:
+                            os.startfile("trae-cn://cc-light.cc-light-helper/focus?pid=" + str(tp))
+                        except Exception:
+                            pass
+                    close_details()
+                row.bind("<Button-1>", _jump)
+                row.configure(cursor="hand2")
+                for _w in row.winfo_children():
+                    _w.bind("<Button-1>", _jump)
+                    _w.configure(cursor="hand2")
         win.update_idletasks()
         ww = win.winfo_reqwidth()
         wh = win.winfo_reqheight()
