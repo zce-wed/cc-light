@@ -548,6 +548,9 @@ def run_gui():
             name = d.get("name") or sid[:8]
             if names.count(d.get("name", "")) > 1:
                 name = name + " " + sid[:4]
+            hwnd = d.get("hwnd")
+            termpid = d.get("termpid")
+            shared = hwnd_count.get(hwnd, 0) > 1
             row = tk.Frame(win, bg=BG)
             row.grid(row=i, column=0, sticky="w", padx=6, pady=1)
             tk.Label(row, text="●", fg=color, bg=BG, font=("Consolas", 10)).pack(side="left")
@@ -556,12 +559,13 @@ def run_gui():
                      font=("Microsoft YaHei", 8, "bold")).pack(side="left")
             tk.Label(row, text="  " + name, fg="#dddddd", bg=BG,
                      font=("Microsoft YaHei", 8)).pack(side="left")
+            if shared and termpid:                       # 同窗口多终端 → 带 #pid,和诊断命令输出对得上
+                tk.Label(row, text="  #" + str(termpid), fg="#9ab8e8", bg=BG,
+                         font=("Consolas", 7)).pack(side="left")
             tk.Label(row, text="  " + human_ago(d.get("ts", 0)), fg="#777777", bg=BG,
                      font=("Consolas", 7)).pack(side="left")
-            hwnd = d.get("hwnd")
-            termpid = d.get("termpid")
             if hwnd or termpid:
-                def _jump(e, h=hwnd, tp=termpid, shared=hwnd_count.get(hwnd, 0) > 1):
+                def _jump(e, h=hwnd, tp=termpid, shared=shared):
                     if h:
                         focus_window(h)               # 先聚焦宿主窗口(总是做,恢复原能力)
                     if tp and shared:                 # 同窗口多终端 → 额外发 URI 精确切到对应终端
