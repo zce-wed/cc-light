@@ -6,8 +6,10 @@ const fs = require('fs');
 const path = require('path');
 
 const DIR = __dirname;
-const SESSIONS_DIR = path.join(DIR, 'sessions');
-const MISS_LOG = path.join(DIR, 'hook-miss.log');
+// 运行数据放 %APPDATA%\cc-light —— ~/.claude 被坚果云同步会清空 sessions,必须移出
+const DATA_DIR = path.join(process.env.APPDATA || DIR, 'cc-light');
+const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
+const MISS_LOG = path.join(DATA_DIR, 'hook-miss.log');
 const COLORS = { red: 1, yellow: 1, green: 1 };
 
 const action = process.argv[2];

@@ -34,14 +34,14 @@ cd ~/.claude/cc-light
 # 1. 启动灯窗口(或双击 start-light.vbs)
 pythonw cc_light.py
 
-# 2. 安装 hooks(自动备份 settings.json)
+# 2. 安装 hooks(注入 settings.json;灯窗口自愈防坚果云覆盖)
 python install-hooks.py install
 
 # 3. 查看注入情况
 python install-hooks.py status
 ```
 
-⚠️ **hooks 改动后需重启 Claude Code 才生效**(本会话已加载旧配置)。
+⚠️ **新开窗口立即生效**;老窗口需重启才会加载新配置。改 hook 后**也要重启交通灯**(右键→重启),灯窗口才用新代码并开启自愈。运行数据(sessions/config/pos)在 `%APPDATA%\cc-light\`,不再在 `~/.claude` 下。
 
 ## 鼠标操作
 
@@ -61,7 +61,7 @@ python install-hooks.py status
 |------|------|
 | `cc_light.py` | 灯窗口(GUI,小尺寸圆角悬浮)+ CLI;扫描 sessions 聚合 |
 | `hook.js` | hook 处理器(node,读 stdin 写 session)。**用 node 不用 pythonw**(pythonw 在 Windows 接 stdin 偶发失败) |
-| `install-hooks.py` | 幂等注入 / 卸载 hook |
+| `install-hooks.py` | 幂等注入 / 卸载 hook(装 settings.json,清理历史 managed 残留) |
 | `start-light.vbs` | 静默启动器(**纯 ASCII**,见下方坑) |
 
 ## 开机自启(可选)
@@ -86,6 +86,7 @@ python install-hooks.py uninstall   # 移除 hooks(自动备份)
 - **状态识别非 100%**:CC 不给「中断」事件、长思考无事件与中断不可区分,故保留超时兜底(右键可调/可关)。
 - **多层执行(子 agent)**:挂 `SubagentStart`/`SubagentStop`,每个 session 维护 `subs` 计数;子 agent 跑期间主 `Stop`/`idle_prompt` 不写 green(保持 yellow),避免「子还在跑却绿灯」。`hook.js` 从只写改为先读后写(合并 `subs`)。
 - **`start-light.vbs` 必须纯 ASCII**:VBScript 在中文系统按 GBK 解析,UTF-8 中文注释会报「缺少对象」。
+- **抗坚果云覆盖 + 清空**:`~/.claude` 整个被坚果云双向同步 —— `settings.json` 的 hook 会被「另一台机器的配置」整体冲掉(表现为「同项目多窗口只亮一个灯」),sessions 目录也曾被同步清空。对策:① hook 装用户级 `settings.json`,由灯窗口 `ensure_hooks` 每 20s 自愈重注入;② 运行数据(sessions/config/pos)移到 `%APPDATA%\cc-light\`,不在同步范围。曾试过 managed-settings.json,但 Windows 下在 `C:\Program Files\ClaudeCode\` 需管理员才能写,弃用。
 
 ## 平台
 

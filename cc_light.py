@@ -19,12 +19,27 @@ import time
 import math
 
 DIR = os.path.dirname(os.path.abspath(__file__))
-SESSIONS_DIR = os.path.join(DIR, "sessions")
-POS_FILE = os.path.join(DIR, "pos.json")
-MISS_LOG = os.path.join(DIR, "hook-miss.log")
+# 运行数据放 %APPDATA%\cc-light —— ~/.claude 被坚果云同步会清空 sessions,必须移出
+DATA_DIR = os.path.join(os.environ.get("APPDATA") or DIR, "cc-light")
+SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
+POS_FILE = os.path.join(DATA_DIR, "pos.json")
+MISS_LOG = os.path.join(DATA_DIR, "hook-miss.log")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 STALE = 1 * 3600        # 1 小时无更新视为僵尸,清理
-CONFIG_FILE = os.path.join(DIR, "config.json")
 DEFAULT_CONFIG = {"yellow_timeout": 180, "timeout_fallback": True}   # 默认 3 分钟 + 开兜底
+
+# ---- 自愈:坚果云覆盖 settings.json 冲掉 hook 时,灯窗口定期重注入 ----
+MARKER = "cc-light/"   # hook 命令路径里都含这个,用于识别/清理 cc-light entry
+SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+HOOK_JS_SELF = os.path.join(DIR, "hook.js").replace("\\", "/")
+SELF_INJECT = {   # 与 install-hooks.py 的 INJECT 保持一致
+    "SessionStart": ("green", "*"), "UserPromptSubmit": ("yellow", "*"),
+    "Stop": ("green", "*"), "PermissionRequest": ("red", "*"),
+    "PostToolUse": ("yellow", "AskUserQuestion|ExitPlanMode"),
+    "Notification": ("green", "idle_prompt"),
+    "SubagentStart": ("sub_start", "*"), "SubagentStop": ("sub_stop", "*"),
+    "SessionEnd": ("end", "*"),
+}
 _config = dict(DEFAULT_CONFIG)
 
 
@@ -131,6 +146,51 @@ def aggregate(sessions):
     best = min((PRIO.get(s, 99) for s in states), default=99)
     inv = {v: k for k, v in PRIO.items()}
     return inv.get(best, "gray"), len(sessions)
+
+
+def _find_node():
+    import shutil as _sh
+    for n in ("node.exe", "node"):
+        p = _sh.which(n)
+        if p:
+            return p.replace("\\", "/")
+    return "node"
+
+
+def _self_entry(action, matcher):
+    node = _find_node()
+    if action == "end":
+        cmd = '"%s" "%s" end' % (node, HOOK_JS_SELF)
+    else:
+        cmd = '"%s" "%s" %s' % (node, HOOK_JS_SELF, action)
+    return {"matcher": matcher, "hooks": [{"type": "command", "command": cmd, "timeout": 5}]}
+
+
+def ensure_hooks():
+    """坚果云会覆盖 settings.json 冲掉 cc-light hook;检测到缺失就重注入(灯窗口周期调用)。"""
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        return
+    have = sum(1 for evt in SELF_INJECT
+               if MARKER in json.dumps(hooks.get(evt, []), ensure_ascii=False))
+    if have >= len(SELF_INJECT):
+        return   # 9 条都在,无需重注入
+    for evt in list(hooks.keys()):
+        if isinstance(hooks[evt], list):
+            hooks[evt] = [e for e in hooks[evt] if MARKER not in json.dumps(e, ensure_ascii=False)]
+    for evt, (action, matcher) in SELF_INJECT.items():
+        hooks.setdefault(evt, []).append(_self_entry(action, matcher))
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+    except Exception:
+        pass
 
 
 def read_stdin_json():
@@ -372,12 +432,16 @@ def run_gui():
             dots.append(cv.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=""))
             x += 2 * r + gap
 
+    heal_counter = [0]
     def poll():
         sessions = read_sessions()
         now = time.time()
         c, n = aggregate(sessions)
         apply(c)
         render_dots(sessions, now)
+        heal_counter[0] += 1
+        if heal_counter[0] % 40 == 0:   # 40 × 500ms = 20s,定期自愈
+            ensure_hooks()
         root.after(500, poll)
 
     # ---- 交互 ----
