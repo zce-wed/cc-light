@@ -11,3 +11,6 @@ __pycache__/
 
 # 备份
 *.bak
+
+# 扩展构建产物(用 vsce 现打包,不入库)
+trae-extension/*.vsix
