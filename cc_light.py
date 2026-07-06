@@ -319,6 +319,73 @@ def focus_window(hwnd):
         return False
 
 
+def find_window_by_name(name):
+    """hwnd 失效时的兜底:按项目名模糊匹配当前可见的顶层窗口。
+    Trae/VSCode reload 或窗口重建后 hwnd 会变,记录的旧 hwnd 就死了;这时用会话的项目名
+    去匹配窗口标题(如 'PortraitEdit.vue - zc-geo-frontend - Trae CN' 含 'zc-geo-frontend'),
+    返回真实可见窗口的 hwnd,没有则返回 None。"""
+    if not name or len(name) < 2:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.IsWindowVisible.argtypes = [wintypes.HWND]; u.IsWindowVisible.restype = wintypes.BOOL
+        u.GetParent.argtypes = [wintypes.HWND]; u.GetParent.restype = wintypes.HWND
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]; u.GetWindowTextLengthW.restype = ctypes.c_int
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        ENUMWNDPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u.EnumWindows.argtypes = [ENUMWNDPROC, wintypes.LPARAM]; u.EnumWindows.restype = wintypes.BOOL
+        target = name.lower()
+        # 终端/编辑器宿主窗口类(VSCode/Trae/Cursor 都是 Chrome_WidgetWin_1,WindowsTerminal 是 CASCADIA)
+        term_classes = ("Chrome_WidgetWin_1", "CASCADIA_HOSTING_WINDOW_CLASS",
+                        "WezTerm", "GHOSTTTY", "Xwindow", "Qt application")
+        best = [None, 0]  # [hwnd, score]
+
+        def _cb(hwnd, _lp):
+            if not u.IsWindowVisible(hwnd) or u.GetParent(hwnd):
+                return True
+            n = u.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            tb = ctypes.create_unicode_buffer(n + 1)
+            u.GetWindowTextW(hwnd, tb, n + 1)
+            title = tb.value
+            if not title or target not in title.lower():
+                return True
+            cb = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(hwnd, cb, 256)
+            cls = cb.value
+            score = 1
+            if any(cls == c or cls.startswith(c) for c in term_classes):
+                score += 5                       # 终端/编辑器宿主类优先
+            tl = title.lower()
+            # 标题里 name 单独成段(典型 'file - name - Trae CN')比单纯子串更可信
+            if (" - " + target + " - ") in tl or tl.startswith(target + " -") or tl.endswith(" - " + target) or tl == target:
+                score += 3
+            if score > best[1]:
+                best[0] = hwnd; best[1] = score
+            return True
+
+        u.EnumWindows(ENUMWNDPROC(_cb), 0)
+        return best[0]
+    except Exception:
+        return None
+
+
+def resolve_hwnd(hwnd, name):
+    """优先用记录的 hwnd;窗口已失效(重建/reload)则按项目名兜底匹配当前可见窗口。"""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        if hwnd and u.IsWindow(hwnd):
+            return hwnd
+    except Exception:
+        pass
+    return find_window_by_name(name)
+
+
 def round_rect(cv, x0, y0, x1, y1, r, **kw):
     """tkinter 圆角矩形(create_polygon 折线近似)"""
     pts = []
@@ -486,7 +553,6 @@ def run_gui():
     cv.bind("<ButtonPress-1>", down)
     cv.bind("<B1-Motion>", move)
     cv.bind("<ButtonRelease-1>", lambda e: save_pos())
-    cv.bind("<Double-Button-1>", lambda e: root.attributes("-topmost", not root.attributes("-topmost")))
     cv.bind("<Enter>", lambda e: details_hover())
     cv.bind("<Leave>", lambda e: schedule_close())
 
@@ -565,10 +631,11 @@ def run_gui():
             tk.Label(row, text="  " + human_ago(d.get("ts", 0)), fg="#777777", bg=BG,
                      font=("Consolas", 7)).pack(side="left")
             if hwnd or termpid:
-                def _jump(e, h=hwnd, tp=termpid, shared=shared):
-                    if h:
-                        focus_window(h)               # 先聚焦宿主窗口(总是做,恢复原能力)
-                    if tp and shared:                 # 同窗口多终端 → 额外发 URI 精确切到对应终端
+                def _jump(e, h=hwnd, tp=termpid, shared=shared, nm=(d.get("name") or sid[:8])):
+                    tgt = resolve_hwnd(h, nm)            # 记录的 hwnd 死了 → 按项目名兜底匹配当前窗口
+                    if tgt:
+                        focus_window(tgt)               # 聚焦宿主窗口
+                    if tp and shared:                   # 同窗口多终端 → 额外发 URI 精确切到对应终端
                         try:
                             os.startfile("trae-cn://cc-light.cc-light-helper/focus?pid=" + str(tp))
                         except Exception:
@@ -623,6 +690,11 @@ def run_gui():
     for sec in (60, 120, 180, 300, 600):
         timeout_menu.add_radiobutton(label="%d 秒" % sec, value=sec, variable=timeout_var, command=on_set_timeout)
 
+    topmost_var = tk.IntVar(value=1)   # 灯窗口默认置顶(原双击切换,易误触 → 改菜单)
+
+    def on_toggle_topmost():
+        root.attributes("-topmost", bool(topmost_var.get()))
+
     menu = tk.Menu(root, tearoff=0)
     menu.add_command(label="清理不活跃会话", command=cleanup_stale)
     menu.add_separator()
@@ -642,6 +714,7 @@ def run_gui():
         root.destroy()
 
     menu.add_separator()
+    menu.add_checkbutton(label="窗口置顶", variable=topmost_var, command=on_toggle_topmost)
     menu.add_command(label="复位位置", command=lambda: root.geometry(default_geo()))
     menu.add_command(label="重启", command=restart)
     menu.add_command(label="退出", command=root.destroy)

@@ -6,32 +6,37 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-// 沿父进程链向上找第一个有窗口的终端(WindowsTerminal/VSCode/cmd)的 HWND,
-// 写进 session 文件,供灯窗口点击会话名时跳转过去。
-function getWindowHwnd() {
-    const script = `$term='WindowsTerminal|conhost|cmd|Code|Trae|Cursor|Windsurf|wezterm|alacritty|Hyper|conemu64|HBuilderX'; $tu=Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);' -Name U -Namespace CC -PassThru; $fg=$tu::GetForegroundWindow(); if($fg -and $fg -ne 0){ $pv=0; [void]$tu::GetWindowThreadProcessId($fg,[ref]$pv); $fp=Get-Process -Id $pv -EA SilentlyContinue; if($fp -and $fp.Name -match $term){ [Console]::Write($fg.ToInt64()); exit } }; $p=$PID;$first=0; while($p){ $pr=Get-CimInstance Win32_Process -Filter ('ProcessId='+$p) -EA SilentlyContinue; if(-not $pr){break}; $proc=Get-Process -Id $p -EA SilentlyContinue; if($proc -and $proc.MainWindowHandle -and $proc.MainWindowHandle -ne 0){ if($first -eq 0){$first=$proc.MainWindowHandle}; if($proc.Name -match $term){[Console]::Write($proc.MainWindowHandle);exit} }; $p=$pr.ParentProcessId }; if($first -ne 0){[Console]::Write($first)}`;
+// 一次 powershell 同时刷新 hwnd + termpid(hook 每次工具调用都触发,合并避免两次进程启动)。
+// 关键:hwnd/termpid 必须在窗口/终端重建后自动刷新 —— 旧实现 `old.hwnd || get()` 是旧值优先,
+// 一旦首次记下就永不更新,窗口重建后留下死 hwnd,点击跳转失效。这里用"新值优先 + 存活守卫":
+// 旧 hwnd 还活着(IsWindow)/旧 termpid 进程还在 → 保留(廉价,不遍历父链);否则沿父链重取。
+function getMeta(prevHwnd, prevPid) {
+    const script = [
+        '$ErrorActionPreference="SilentlyContinue"',
+        'Add-Type -MemberDefinition \'[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h); [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);\' -Name U -Namespace CCL -PassThru | Out-Null',
+        // ---- hwnd:旧值存活则保留,否则重取(GetForegroundWindow 快速路径 → 父链兜底) ----
+        '$hwnd=0; $prev=[int64]$env:PREV_HWND',
+        'if($prev -and [CCL.U]::IsWindow([IntPtr]$prev)){ $hwnd=$prev }',
+        'else{',
+        '  $term="WindowsTerminal|conhost|cmd|Code|Trae|Cursor|Windsurf|wezterm|alacritty|Hyper|conemu64|HBuilderX"',
+        '  $fg=[CCL.U]::GetForegroundWindow()',
+        '  if($fg -and $fg -ne 0){ $pv=0; [void][CCL.U]::GetWindowThreadProcessId($fg,[ref]$pv); $fp=Get-Process -Id $pv; if($fp -and $fp.Name -match $term){ $hwnd=[int64]$fg } }',
+        '  if(-not $hwnd){ $p=$PID; $first=0; while($p){ $pr=Get-CimInstance Win32_Process -Filter ("ProcessId="+$p); if(-not $pr){break}; $proc=Get-Process -Id $p; if($proc -and $proc.MainWindowHandle -and $proc.MainWindowHandle -ne 0){ if($first -eq 0){$first=[int64]$proc.MainWindowHandle}; if($proc.Name -match $term){$hwnd=[int64]$proc.MainWindowHandle;break} }; $p=$pr.ParentProcessId }; if(-not $hwnd -and $first){ $hwnd=$first } }',
+        '}',
+        // ---- termpid:旧进程还在则保留,否则沿父链找 name 含 claude 的进程,取其父 ----
+        '$tpid=0; $prevT=[int64]$env:PREV_TPID',
+        'if($prevT -and (Get-Process -Id $prevT)){ $tpid=$prevT }',
+        'else{ $p=$PID; while($p){ $pr=Get-CimInstance Win32_Process -Filter ("ProcessId="+$p); if(-not $pr){break}; $proc=Get-Process -Id $p; if($proc -and $proc.Name -match "claude"){ $tpid=[int64]$pr.ParentProcessId; break }; $p=$pr.ParentProcessId } }',
+        '[Console]::Write($hwnd.ToString()+"`t"+$tpid.ToString())'
+    ].join('\n');
     try {
         const out = execFileSync('powershell', ['-NoProfile', '-Command', script],
-                                 { encoding: 'utf8', timeout: 10000, windowsHide: true });
-        const h = parseInt(String(out).trim(), 10);
-        return (isNaN(h) || h === 0) ? 0 : h;
-    } catch (e) { return 0; }
-}
-
-// terminal.processId = claude.exe 的父进程(VS Code 报告那一层,如 2132)。
-// hook 进程链: hook → hook-runner → claude.exe → <term.processId>。
-// 故从 process.ppid 向上找 name 含 claude 的进程,返回其父 pid。
-function getTerminalPid() {
-    const startPid = process.ppid;
-    if (!startPid) return 0;
-    const script = `$p=[int]$env:START_PID; while($p){ $pr=Get-CimInstance Win32_Process -Filter ('ProcessId='+$p) -EA SilentlyContinue; if(-not $pr){break}; $proc=Get-Process -Id $p -EA SilentlyContinue; if($proc -and $proc.Name -match 'claude'){ [Console]::Write($pr.ParentProcessId); break }; $p=$pr.ParentProcessId }`;
-    try {
-        const out = execFileSync('powershell', ['-NoProfile', '-Command', script],
-                                 { encoding: 'utf8', timeout: 10000, windowsHide: true,
-                                   env: Object.assign({}, process.env, { START_PID: String(startPid) }) });
-        const pid = parseInt(String(out).trim(), 10);
-        return (isNaN(pid) || pid === 0) ? 0 : pid;
-    } catch (e) { return 0; }
+            { encoding: 'utf8', timeout: 10000, windowsHide: true,
+              env: Object.assign({}, process.env, { PREV_HWND: String(prevHwnd || 0), PREV_TPID: String(prevPid || 0) }) });
+        const parts = String(out).trim().split(/\s+/);
+        const h = parseInt(parts[0], 10), t = parseInt(parts[1], 10);
+        return { hwnd: (isNaN(h) ? 0 : h), termpid: (isNaN(t) ? 0 : t) };
+    } catch (e) { return { hwnd: 0, termpid: 0 }; }
 }
 
 const DIR = __dirname;
@@ -85,7 +90,8 @@ const now = Date.now() / 1000;
 // subagent start: subs+1, write yellow (a subagent running => the session is busy)
 if (action === 'sub_start') {
     const old = readSession(sid) || {};
-    writeSession(sid, { state: 'yellow', msg: '', ts: now, name: old.name || name, subs: (old.subs || 0) + 1, hwnd: old.hwnd || getWindowHwnd(), termpid: old.termpid || getTerminalPid() });
+    const meta = getMeta(old.hwnd, old.termpid);
+    writeSession(sid, { state: 'yellow', msg: '', ts: now, name: old.name || name, subs: (old.subs || 0) + 1, hwnd: meta.hwnd || old.hwnd || 0, termpid: meta.termpid || old.termpid || 0 });
     process.exit(0);
 }
 // subagent stop: subs-1, do NOT change state (the main agent may spawn another subagent)
@@ -103,14 +109,15 @@ if (action === 'green') {
     if (old && (old.subs || 0) > 0) process.exit(0);
 }
 
-// normal write (yellow/red/green), preserve old name + subs + hwnd
+// normal write (yellow/red/green), preserve old name + subs, refresh hwnd/termpid
 const old = readSession(sid);
+const meta = getMeta(old && old.hwnd, old && old.termpid);
 writeSession(sid, {
     state: action,
     msg: '',
     ts: now,
     name: (old && old.name) || name,
     subs: (old && old.subs) || 0,
-    hwnd: (old && old.hwnd) || getWindowHwnd(),
-    termpid: (old && old.termpid) || getTerminalPid(),
+    hwnd: meta.hwnd || (old && old.hwnd) || 0,
+    termpid: meta.termpid || (old && old.termpid) || 0,
 });
