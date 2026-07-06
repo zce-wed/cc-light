@@ -646,6 +646,22 @@ def run_gui():
                 for _w in row.winfo_children():
                     _w.bind("<Button-1>", _jump)
                     _w.configure(cursor="hand2")
+            # 右键会话行:删除该会话(清理残留/不想要的条目;若会话仍活跃,下次 hook 会重建)
+            def _on_right(e, s=sid):
+                m = tk.Menu(root, tearoff=0, bg=BG, fg="#dddddd",
+                            activebackground="#3a3a3a", activeforeground="#ffffff")
+                def _do():
+                    delete_session(s)
+                    close_details()
+                    root.after(20, details_hover)    # 关闭后重开 → 刷新列表
+                m.add_command(label="删除该会话", command=_do)
+                try:
+                    m.tk_popup(e.x_root, e.y_root)
+                finally:
+                    m.grab_release()
+            row.bind("<Button-3>", _on_right)
+            for _w in row.winfo_children():
+                _w.bind("<Button-3>", _on_right)
         win.update_idletasks()
         ww = win.winfo_reqwidth()
         wh = win.winfo_reqheight()
