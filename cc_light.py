@@ -22,10 +22,11 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 # 运行数据放 %APPDATA%\cc-light —— ~/.claude 被坚果云同步会清空 sessions,必须移出
 DATA_DIR = os.path.join(os.environ.get("APPDATA") or DIR, "cc-light")
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
+ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")   # 归档被删会话,供「检测所有会话」还原
 POS_FILE = os.path.join(DATA_DIR, "pos.json")
 MISS_LOG = os.path.join(DATA_DIR, "hook-miss.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-STALE = 1 * 3600        # 1 小时无更新视为僵尸,清理
+STALE = 1 * 3600        # 1 小时无更新 → 归档(可被「检测所有会话」还原)
 DEFAULT_CONFIG = {"yellow_timeout": 180, "timeout_fallback": True}   # 默认 3 分钟 + 开兜底
 
 # ---- 自愈:坚果云覆盖 settings.json 冲掉 hook 时,灯窗口定期重注入 ----
@@ -102,6 +103,19 @@ def delete_session(sid):
         pass
 
 
+def archive_session(sid):
+    """把会话移到归档(不真删),供「检测所有会话」还原。会话真正结束(--end)走 delete_session。"""
+    safe = "".join(c for c in sid if c.isalnum() or c in ("_", "-")) or "unknown"
+    src = os.path.join(SESSIONS_DIR, safe + ".json")
+    if not os.path.exists(src):
+        return
+    try:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        os.replace(src, os.path.join(ARCHIVE_DIR, safe + ".json"))
+    except OSError:
+        pass
+
+
 def read_sessions(now=None):
     ensure_dir()
     now = now if now is not None else time.time()
@@ -118,10 +132,14 @@ def read_sessions(now=None):
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
             if now - d.get("ts", 0) > STALE:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                if is_session_alive(d):       # 过期但终端/窗口还开着(只是不活跃)→ 保留
+                    out[fn[:-5]] = d
+                else:                         # 过期且已关闭 → 归档(可还原),不真删
+                    try:
+                        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+                        os.replace(path, os.path.join(ARCHIVE_DIR, fn))
+                    except OSError:
+                        pass
                 continue
             out[fn[:-5]] = d
         except Exception:
@@ -384,6 +402,38 @@ def resolve_hwnd(hwnd, name):
     except Exception:
         pass
     return find_window_by_name(name)
+
+
+def is_process_alive(pid):
+    """进程是否仍在运行。OpenProcess 对已退出但对象尚未释放的进程也会返回句柄(Windows 经典坑),
+    所以必须再调 GetExitCodeProcess —— 只有 STILL_ACTIVE(259) 才算真活着,否则是僵尸/已退出。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k.GetExitCodeProcess.restype = wintypes.BOOL
+        h = k.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = wintypes.DWORD()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259        # STILL_ACTIVE
+    except Exception:
+        return False
+
+
+def is_session_alive(d):
+    """会话是否仍开着。有 termpid 时以终端进程为准 —— 关了那个终端 tab 就算结束,
+    即便宿主窗口(Trae 主窗口)还在;无 termpid 则看窗口(hwnd 活或按项目名找到当前窗口)。"""
+    tp = d.get("termpid")
+    if tp:
+        return is_process_alive(tp)
+    return bool(resolve_hwnd(d.get("hwnd"), d.get("name")))
 
 
 def round_rect(cv, x0, y0, x1, y1, r, **kw):
@@ -651,7 +701,7 @@ def run_gui():
                 m = tk.Menu(root, tearoff=0, bg=BG, fg="#dddddd",
                             activebackground="#3a3a3a", activeforeground="#ffffff")
                 def _do():
-                    delete_session(s)
+                    archive_session(s)               # 归档(可还原),非真删
                     close_details()
                     root.after(20, details_hover)    # 关闭后重开 → 刷新列表
                 m.add_command(label="删除该会话", command=_do)
@@ -680,12 +730,45 @@ def run_gui():
         win.bind("<Leave>", lambda e: schedule_close())
 
     def cleanup_stale():
-        """删超过超时阈值无更新的会话(关窗口没触发 SessionEnd 的残留)"""
+        """归档超过超时阈值无更新的会话(归档而非真删,可用「检测所有会话」还原)。"""
         thr = _config["yellow_timeout"]
         now = time.time()
         for sid, d in list(read_sessions().items()):
             if now - d.get("ts", 0) > thr:
-                delete_session(sid)
+                archive_session(sid)
+        sessions = read_sessions()
+        c, n = aggregate(sessions)
+        apply(c)
+        render_dots(sessions, time.time())
+
+    def restore_sessions():
+        """「检测所有会话」:把归档里重新开着的会话还原回列表。
+        仍处于已关闭状态(终端进程没了)的不还原、并清掉归档,避免把死会话刷回来。"""
+        now = time.time()
+        try:
+            files = os.listdir(ARCHIVE_DIR)
+        except OSError:
+            files = []
+        for fn in files:
+            if not fn.endswith(".json"):
+                continue
+            src = os.path.join(ARCHIVE_DIR, fn)
+            dst = os.path.join(SESSIONS_DIR, fn)
+            if os.path.exists(dst):              # 列表已有(活跃),归档副本作废
+                try: os.remove(src)
+                except OSError: pass
+                continue
+            try:
+                with open(src, "r", encoding="utf-8") as f:
+                    dd = json.load(f)
+                if is_session_alive(dd):         # 重新开着 → 还原(刷 ts 避免刚还原又被归档)
+                    dd["ts"] = now
+                    with open(dst, "w", encoding="utf-8") as f:
+                        json.dump(dd, f)
+                # 已关闭的 → 不还原
+                os.remove(src)                   # 无论还原与否,归档原文件都清掉
+            except Exception:
+                pass
         sessions = read_sessions()
         c, n = aggregate(sessions)
         apply(c)
@@ -713,6 +796,7 @@ def run_gui():
 
     menu = tk.Menu(root, tearoff=0)
     menu.add_command(label="清理不活跃会话", command=cleanup_stale)
+    menu.add_command(label="检测所有会话", command=restore_sessions)   # 还原被清理/删除的会话
     menu.add_separator()
     menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
     menu.add_cascade(label="超时时间", menu=timeout_menu)
