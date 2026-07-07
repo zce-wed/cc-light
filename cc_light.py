@@ -799,32 +799,56 @@ def run_gui():
 
     def restore_sessions():
         """「检测所有会话」:
-        1) 扫 ~/.claude/projects 下最近活跃(SCAN_ACTIVE 内)的 jsonl → 补建 sessions 里缺失的会话
-           (sid=文件名、项目名=目录名、state=yellow、hwnd/termpid=0,标 scanned)。
-           已在列表的刷 ts 防误归档;scanned 但 jsonl 已不活跃(真关了)的清理掉。
-           —— 救那些启动时 hook 没注入、从没写过 session 文件的开着的会话。
+        1) 扫 ~/.claude/projects 下 SCAN_ACTIVE 内活跃的 jsonl,按项目分组取 mtime 最新的会话,
+           补建 sessions 里缺失的(标 scanned)。已在列表的项目不重复补 —— 避免把同项目今天
+           已关的旧会话(jsonl 仍在窗口内)误补进来。救那些启动时 hook 没注入、从没写过
+           session 文件的开着的会话。
         2) 兼容:从 archive 还原重新开着的会话(老数据路径)。"""
         now = time.time()
         active = scan_active_jsonl(SCAN_ACTIVE)
-        # ---- 1) 补建/刷新/清理(以 jsonl 活跃度为准) ----
-        for sid, info in active.items():
-            path = os.path.join(SESSIONS_DIR, sid + ".json")
-            if os.path.exists(path):             # 已在列表:刷 ts,避免被判归档
+        # 已在列表的真实会话 sid(非 scanned —— hook 真写过的;scanned 是上次扫描补的,不算该项目已占用)
+        existing = set()
+        try:
+            for fn in os.listdir(SESSIONS_DIR):
+                if not fn.endswith(".json"):
+                    continue
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
+                    with open(os.path.join(SESSIONS_DIR, fn), "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                except Exception:
+                    continue
+                if not d.get("scanned"):
+                    existing.add(fn[:-5])
+        except OSError:
+            pass
+        # 按项目分组,每组取 mtime 最新的 sid(= 该项目当前会话);该项目已有会话则跳过
+        by_proj = {}
+        for sid, info in active.items():
+            by_proj.setdefault(info["name"], []).append((info["mtime"], sid))
+        to_build = {}
+        for lst in by_proj.values():
+            lst.sort(reverse=True)
+            newest = lst[0][1]
+            if newest not in existing:
+                to_build[newest] = active[newest]
+        # 刷已存在且仍活跃会话的 ts(防被判归档)
+        for sid in existing:
+            if sid in active:
+                try:
+                    with open(os.path.join(SESSIONS_DIR, sid + ".json"), "r", encoding="utf-8") as f:
                         d = json.load(f)
                     d["ts"] = now
-                    if not d.get("name"):
-                        d["name"] = info["name"]
                     _write_session_file(sid, d)
                 except Exception:
                     pass
-            else:                                # 缺失:补建,标 scanned 等 hook 接管
-                _write_session_file(sid, {
-                    "state": "yellow", "msg": "", "ts": now, "name": info["name"],
-                    "subs": 0, "hwnd": 0, "termpid": 0, "scanned": True,
-                })
-        try:                                     # 清理:scanned 会话其 jsonl 已不活跃 → 删掉
+        # 补建缺失(标 scanned 等 hook 接管)
+        for sid, info in to_build.items():
+            _write_session_file(sid, {
+                "state": "yellow", "msg": "", "ts": now, "name": info["name"],
+                "subs": 0, "hwnd": 0, "termpid": 0, "scanned": True,
+            })
+        # 清理:scanned 会话不在 to_build 的(同项目误补的旧会话 / jsonl 已不活跃)→ 删
+        try:
             for fn in os.listdir(SESSIONS_DIR):
                 if not fn.endswith(".json"):
                     continue
@@ -835,7 +859,7 @@ def run_gui():
                         d = json.load(f)
                 except Exception:
                     continue
-                if d.get("scanned") and sid not in active:
+                if d.get("scanned") and sid not in to_build:
                     try: os.remove(p)
                     except OSError: pass
         except OSError:
