@@ -118,10 +118,97 @@ def proj_name(enc_dir):
     return name or enc_dir or "?"
 
 
+def _encode_path(path):
+    """真实路径 → Claude Code projects 目录编码(非 [字母数字_-] 逐字符替成 -)。
+    C:\\Users\\...\\zc-geo-frontend → C--Users-...-zc-geo-frontend。"""
+    return "".join(c if c.isalnum() or c in "-_" else "-" for c in (path or ""))
+
+
+def _claude_proc_cwds():
+    """当前所有 claude.exe 进程的工作目录 → 进程数(collections.Counter)。
+    用 ctypes NtQueryInformationProcess 读 PEB 拿 cwd(无依赖,精确判活) —— 进程 cwd 即
+    会话项目目录,能区分『开着』和『刚关』(后者无 claude.exe 进程)。读失败返回空 Counter。"""
+    from collections import Counter
+    cnt = Counter()
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        psapi = ctypes.windll.psapi
+        DWORD = ctypes.c_uint32
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+        k.ReadProcessMemory.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+
+        class PBI(ctypes.Structure):
+            _fields_ = [("r1", ctypes.c_void_p), ("peb", ctypes.c_void_p),
+                        ("r2", ctypes.c_void_p * 2), ("pid", ctypes.c_void_p), ("r3", ctypes.c_void_p)]
+
+        arr = (DWORD * 4096)()
+        ret = DWORD()
+        if not psapi.EnumProcesses(ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(ret)):
+            return cnt
+        for i in range(ret.value):
+            pid = arr[i]
+            if pid == 0:
+                continue
+            h = k.OpenProcess(0x1000, False, pid)        # QUERY_LIMITED_INFORMATION:够拿 image name
+            if not h:
+                continue
+            try:
+                img = ctypes.create_unicode_buffer(260)
+                n = DWORD(260)
+                if not (k.QueryFullProcessImageNameW(h, 0, img, ctypes.byref(n)) and img.value.lower().endswith("claude.exe")):
+                    continue
+            finally:
+                k.CloseHandle(h)
+            h2 = k.OpenProcess(0x410, False, pid)        # QUERY_INFORMATION | VM_READ:读 PEB 拿 cwd
+            if not h2:
+                continue
+            try:
+                pbi = PBI()
+                if ntdll.NtQueryInformationProcess(h2, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None):
+                    continue
+                peb = pbi.peb
+                if not peb:
+                    continue
+                pp = ctypes.c_void_p(); rl = ctypes.c_size_t()
+                if not k.ReadProcessMemory(h2, ctypes.c_void_p(peb + 0x20), ctypes.byref(pp), ctypes.sizeof(pp), ctypes.byref(rl)):
+                    continue
+                length = ctypes.c_ushort(); bufptr = ctypes.c_void_p()
+                k.ReadProcessMemory(h2, ctypes.c_void_p(pp.value + 0x38), ctypes.byref(length), 2, ctypes.byref(rl))
+                k.ReadProcessMemory(h2, ctypes.c_void_p(pp.value + 0x40), ctypes.byref(bufptr), ctypes.sizeof(bufptr), ctypes.byref(rl))
+                if not bufptr.value or length.value < 2:
+                    continue
+                buf = ctypes.create_unicode_buffer(length.value // 2 + 1)
+                if not k.ReadProcessMemory(h2, bufptr, buf, length.value, ctypes.byref(rl)):
+                    continue
+                cwd = buf.value.rstrip("\\/").lower()
+                if cwd:
+                    cnt[cwd] += 1
+            except Exception:
+                pass
+            finally:
+                k.CloseHandle(h2)
+    except Exception:
+        pass
+    return cnt
+
+
 def scan_active_jsonl(threshold_sec):
-    """扫 ~/.claude/projects/<proj>/<sid>.jsonl,mtime 在 threshold 内视为会话仍开着。
-    返回 {sid: {"name": 项目名, "mtime": ...}}。subagents 子目录不扫(它们在 <sid>/subagents/ 下)。"""
+    """扫 ~/.claude/projects/<proj>/<sid>.jsonl,只保留【当前有 claude.exe 进程在跑】的项目
+    (按进程 cwd 精确判活 —— 没进程的项目即已关,不补,避免误补刚关的旧会话)。同项目按其
+    claude 进程数取最新 N 个 jsonl(PM 开 2 个就取 2 个)。返回 {sid: {"name", "mtime"}}。"""
     base = os.path.join(os.environ.get("USERPROFILE") or DIR, ".claude", "projects")
+    cwd_cnt = _claude_proc_cwds()                 # cwd(小写) -> claude 进程数
+    active_enc = {}                               # 编码项目目录(小写) -> 进程数
+    for cwd, c in cwd_cnt.items():
+        active_enc[_encode_path(cwd).lower()] = c
     out = {}
     now = time.time()
     try:
@@ -129,24 +216,30 @@ def scan_active_jsonl(threshold_sec):
     except OSError:
         return out
     for proj in projects:
+        n = active_enc.get(proj.lower())
+        if not n:                                 # 该项目无活 claude 进程 → 跳过
+            continue
         pdir = os.path.join(base, proj)
         if not os.path.isdir(pdir):
             continue
+        cands = []
         try:
-            files = os.listdir(pdir)
+            for fn in os.listdir(pdir):
+                if not fn.endswith(".jsonl"):
+                    continue
+                path = os.path.join(pdir, fn)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if now - mtime > threshold_sec:
+                    continue
+                cands.append((mtime, fn[:-6]))
         except OSError:
             continue
-        for fn in files:
-            if not fn.endswith(".jsonl"):
-                continue
-            path = os.path.join(pdir, fn)
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            if now - mtime > threshold_sec:
-                continue
-            out[fn[:-6]] = {"name": proj_name(proj), "mtime": mtime}
+        cands.sort(reverse=True)                  # 最新在前
+        for mtime, sid in cands[:n]:              # 该项目取最新 n 个(= 其 claude 进程数)
+            out[sid] = {"name": proj_name(proj), "mtime": mtime}
     return out
 
 
@@ -799,13 +892,12 @@ def run_gui():
 
     def restore_sessions():
         """「检测所有会话」:
-        1) 扫 ~/.claude/projects 下 SCAN_ACTIVE 内活跃的 jsonl,按项目分组取 mtime 最新的会话,
-           补建 sessions 里缺失的(标 scanned)。已在列表的项目不重复补 —— 避免把同项目今天
-           已关的旧会话(jsonl 仍在窗口内)误补进来。救那些启动时 hook 没注入、从没写过
-           session 文件的开着的会话。
-        2) 兼容:从 archive 还原重新开着的会话(老数据路径)。"""
+        扫 ~/.claude/projects 下 SCAN_ACTIVE 内的 jsonl,只保留【有 claude.exe 进程在跑】
+        的项目(scan_active_jsonl 按进程 cwd 判活 —— 已关的不会误补),补建 sessions 里缺失的
+        (标 scanned)。救那些 hook 没注入、从没写过 session 文件的开着的会话。
+        兼容:从 archive 还原重新开着的会话。"""
         now = time.time()
-        active = scan_active_jsonl(SCAN_ACTIVE)
+        active = scan_active_jsonl(SCAN_ACTIVE)   # 只含活会话(进程 cwd 过滤过)
         # 已在列表的真实会话 sid(非 scanned —— hook 真写过的;scanned 是上次扫描补的,不算该项目已占用)
         existing = set()
         try:
@@ -821,16 +913,7 @@ def run_gui():
                     existing.add(fn[:-5])
         except OSError:
             pass
-        # 按项目分组,每组取 mtime 最新的 sid(= 该项目当前会话);该项目已有会话则跳过
-        by_proj = {}
-        for sid, info in active.items():
-            by_proj.setdefault(info["name"], []).append((info["mtime"], sid))
-        to_build = {}
-        for lst in by_proj.values():
-            lst.sort(reverse=True)
-            newest = lst[0][1]
-            if newest not in existing:
-                to_build[newest] = active[newest]
+        to_build = {sid: info for sid, info in active.items() if sid not in existing}
         # 刷已存在且仍活跃会话的 ts(防被判归档)
         for sid in existing:
             if sid in active:
@@ -847,7 +930,7 @@ def run_gui():
                 "state": "yellow", "msg": "", "ts": now, "name": info["name"],
                 "subs": 0, "hwnd": 0, "termpid": 0, "scanned": True,
             })
-        # 清理:scanned 会话不在 to_build 的(同项目误补的旧会话 / jsonl 已不活跃)→ 删
+        # 清理:scanned 会话其进程已没了(不在 active) → 删
         try:
             for fn in os.listdir(SESSIONS_DIR):
                 if not fn.endswith(".json"):
@@ -859,7 +942,7 @@ def run_gui():
                         d = json.load(f)
                 except Exception:
                     continue
-                if d.get("scanned") and sid not in to_build:
+                if d.get("scanned") and sid not in active:
                     try: os.remove(p)
                     except OSError: pass
         except OSError:
