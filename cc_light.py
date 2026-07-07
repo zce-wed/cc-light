@@ -27,6 +27,7 @@ POS_FILE = os.path.join(DATA_DIR, "pos.json")
 MISS_LOG = os.path.join(DATA_DIR, "hook-miss.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 STALE = 1 * 3600        # 1 小时无更新 → 归档(可被「检测所有会话」还原)
+SCAN_ACTIVE = 6 * 3600  # 「检测所有会话」:jsonl 6h 内有写入视为会话仍开着(覆盖午休等长空闲)
 DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
 
 # ---- 自愈:坚果云覆盖 settings.json 冲掉 hook 时,灯窗口定期重注入 ----
@@ -103,6 +104,64 @@ def delete_session(sid):
         pass
 
 
+def _encode_home_prefix():
+    """用户主目录 → Claude Code projects 目录的编码前缀(非字母数字字符逐个替成 '-')。
+    如 C:\\Users\\zhongce-pm → C--Users-zhongce-pm,用于从编码目录名剥掉主目录前缀。"""
+    home = os.environ.get("USERPROFILE") or ""
+    return "".join(c if c.isalnum() else "-" for c in home)
+
+
+def proj_name(enc_dir):
+    """编码项目目录名(C--Users-...-zc-geo-frontend)→ 可读项目名(剥主目录前缀,保留剩余相对路径)。"""
+    pre = _encode_home_prefix()
+    name = enc_dir[len(pre):].lstrip("-") if pre and enc_dir.startswith(pre) else enc_dir
+    return name or enc_dir or "?"
+
+
+def scan_active_jsonl(threshold_sec):
+    """扫 ~/.claude/projects/<proj>/<sid>.jsonl,mtime 在 threshold 内视为会话仍开着。
+    返回 {sid: {"name": 项目名, "mtime": ...}}。subagents 子目录不扫(它们在 <sid>/subagents/ 下)。"""
+    base = os.path.join(os.environ.get("USERPROFILE") or DIR, ".claude", "projects")
+    out = {}
+    now = time.time()
+    try:
+        projects = os.listdir(base)
+    except OSError:
+        return out
+    for proj in projects:
+        pdir = os.path.join(base, proj)
+        if not os.path.isdir(pdir):
+            continue
+        try:
+            files = os.listdir(pdir)
+        except OSError:
+            continue
+        for fn in files:
+            if not fn.endswith(".jsonl"):
+                continue
+            path = os.path.join(pdir, fn)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if now - mtime > threshold_sec:
+                continue
+            out[fn[:-6]] = {"name": proj_name(proj), "mtime": mtime}
+    return out
+
+
+def _write_session_file(sid, d):
+    """写 session 文件(灯窗口单线程,普通写即可)。"""
+    safe = "".join(c for c in sid if c.isalnum() or c in ("_", "-")) or "unknown"
+    path = os.path.join(SESSIONS_DIR, safe + ".json")
+    ensure_dir()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
 def archive_session(sid):
     """把会话移到归档(不真删),供「检测所有会话」还原。会话真正结束(--end)走 delete_session。"""
     safe = "".join(c for c in sid if c.isalnum() or c in ("_", "-")) or "unknown"
@@ -131,7 +190,7 @@ def read_sessions(now=None):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if not is_session_alive(d):       # 终端/窗口都没了(已关闭) → 立刻归档,不论多久没更新
+            if not d.get("scanned") and not is_session_alive(d):   # scanned(扫 jsonl 补建的,hwnd/termpid=0)跳过归档,生命周期由「检测所有会话」按 jsonl 活跃度管
                 try:
                     os.makedirs(ARCHIVE_DIR, exist_ok=True)
                     os.replace(path, os.path.join(ARCHIVE_DIR, fn))
@@ -739,9 +798,49 @@ def run_gui():
         render_dots(sessions, time.time())
 
     def restore_sessions():
-        """「检测所有会话」:把归档里重新开着的会话还原回列表。
-        仍处于已关闭状态(终端进程没了)的不还原、并清掉归档,避免把死会话刷回来。"""
+        """「检测所有会话」:
+        1) 扫 ~/.claude/projects 下最近活跃(SCAN_ACTIVE 内)的 jsonl → 补建 sessions 里缺失的会话
+           (sid=文件名、项目名=目录名、state=yellow、hwnd/termpid=0,标 scanned)。
+           已在列表的刷 ts 防误归档;scanned 但 jsonl 已不活跃(真关了)的清理掉。
+           —— 救那些启动时 hook 没注入、从没写过 session 文件的开着的会话。
+        2) 兼容:从 archive 还原重新开着的会话(老数据路径)。"""
         now = time.time()
+        active = scan_active_jsonl(SCAN_ACTIVE)
+        # ---- 1) 补建/刷新/清理(以 jsonl 活跃度为准) ----
+        for sid, info in active.items():
+            path = os.path.join(SESSIONS_DIR, sid + ".json")
+            if os.path.exists(path):             # 已在列表:刷 ts,避免被判归档
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    d["ts"] = now
+                    if not d.get("name"):
+                        d["name"] = info["name"]
+                    _write_session_file(sid, d)
+                except Exception:
+                    pass
+            else:                                # 缺失:补建,标 scanned 等 hook 接管
+                _write_session_file(sid, {
+                    "state": "yellow", "msg": "", "ts": now, "name": info["name"],
+                    "subs": 0, "hwnd": 0, "termpid": 0, "scanned": True,
+                })
+        try:                                     # 清理:scanned 会话其 jsonl 已不活跃 → 删掉
+            for fn in os.listdir(SESSIONS_DIR):
+                if not fn.endswith(".json"):
+                    continue
+                sid = fn[:-5]
+                p = os.path.join(SESSIONS_DIR, fn)
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                except Exception:
+                    continue
+                if d.get("scanned") and sid not in active:
+                    try: os.remove(p)
+                    except OSError: pass
+        except OSError:
+            pass
+        # ---- 2) archive 还原(兼容老数据) ----
         try:
             files = os.listdir(ARCHIVE_DIR)
         except OSError:
@@ -762,7 +861,6 @@ def run_gui():
                     dd["ts"] = now
                     with open(dst, "w", encoding="utf-8") as f:
                         json.dump(dd, f)
-                # 已关闭的 → 不还原
                 os.remove(src)                   # 无论还原与否,归档原文件都清掉
             except Exception:
                 pass
