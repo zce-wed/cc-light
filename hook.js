@@ -46,7 +46,9 @@ const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 const MISS_LOG = path.join(DATA_DIR, 'hook-miss.log');
 const COLORS = { red: 1, yellow: 1, green: 1 };
 
-const action = process.argv[2];
+const rawAction = process.argv[2];
+const SOFT = rawAction === 'yellow_soft';   // PostToolUse 心跳:只刷 state/ts,跳过 getMeta 避免每个工具都起 powershell
+const action = SOFT ? 'yellow' : rawAction;
 
 let raw = '';
 try { raw = fs.readFileSync(0, 'utf8'); } catch (e) {}
@@ -111,7 +113,10 @@ if (action === 'green') {
 
 // normal write (yellow/red/green), preserve old name + subs, refresh hwnd/termpid
 const old = readSession(sid);
-const meta = getMeta(old && old.hwnd, old && old.termpid);
+// SOFT(工具心跳)跳过 getMeta:hwnd/termpid 沿用旧值,避免 Claude 每个工具都起 powershell 拖慢响应
+const meta = SOFT
+    ? { hwnd: (old && old.hwnd) || 0, termpid: (old && old.termpid) || 0 }
+    : getMeta(old && old.hwnd, old && old.termpid);
 writeSession(sid, {
     state: action,
     msg: '',

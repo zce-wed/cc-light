@@ -53,13 +53,15 @@ MANAGED_PATHS = [
 #  - 红用 PermissionRequest(权限对话框出现时),不用 Notification ——
 #    Notification 还含 idle_prompt(闲置等待时触发),会把空闲误判成红灯常亮。
 #  - 不挂 PreToolUse。曾挂它(async)写入迟于 Stop、覆盖绿灯,导致会话结束后灯一直闪黄。
+#  - PostToolUse 挂所有工具写 yellow_soft(心跳):Claude 每个工具完成刷 ts,长任务不会因超时
+#    被误判完成;Esc 中断不产生工具事件 → ts 停 → 短超时降绿。SOFT 跳过 getMeta(不起 powershell)。
 #  - SessionEnd 用 end 删该会话文件,避免已关闭窗口状态残留(失败靠超时清理兜底)。
 INJECT = {
     "SessionStart":      ("green",      "*", False),
     "UserPromptSubmit":  ("yellow",     "*", False),
     "Stop":              ("green",      "*", False),
     "PermissionRequest": ("red",        "*", False),
-    "PostToolUse":       ("yellow", "AskUserQuestion|ExitPlanMode", False),
+    "PostToolUse":       ("yellow_soft", "*", False),   # 工具心跳:每个工具完成刷 ts(长任务不超时;中断 ts 停 → 降绿)
     "Notification":      ("green", "idle_prompt", False),
     "SubagentStart":     ("sub_start", "*", False),
     "SubagentStop":      ("sub_stop",  "*", False),

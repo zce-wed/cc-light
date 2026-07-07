@@ -27,7 +27,7 @@ POS_FILE = os.path.join(DATA_DIR, "pos.json")
 MISS_LOG = os.path.join(DATA_DIR, "hook-miss.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 STALE = 1 * 3600        # 1 小时无更新 → 归档(可被「检测所有会话」还原)
-DEFAULT_CONFIG = {"yellow_timeout": 180, "timeout_fallback": True}   # 默认 3 分钟 + 开兜底
+DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
 
 # ---- 自愈:坚果云覆盖 settings.json 冲掉 hook 时,灯窗口定期重注入 ----
 MARKER = "cc-light/"   # hook 命令路径里都含这个,用于识别/清理 cc-light entry
@@ -36,7 +36,7 @@ HOOK_JS_SELF = os.path.join(DIR, "hook.js").replace("\\", "/")
 SELF_INJECT = {   # 与 install-hooks.py 的 INJECT 保持一致
     "SessionStart": ("green", "*"), "UserPromptSubmit": ("yellow", "*"),
     "Stop": ("green", "*"), "PermissionRequest": ("red", "*"),
-    "PostToolUse": ("yellow", "AskUserQuestion|ExitPlanMode"),
+    "PostToolUse": ("yellow_soft", "*"),   # 工具心跳:刷 ts,长任务不超时;SOFT 跳过 getMeta
     "Notification": ("green", "idle_prompt"),
     "SubagentStart": ("sub_start", "*"), "SubagentStop": ("sub_stop", "*"),
     "SessionEnd": ("end", "*"),
@@ -131,15 +131,12 @@ def read_sessions(now=None):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if now - d.get("ts", 0) > STALE:
-                if is_session_alive(d):       # 过期但终端/窗口还开着(只是不活跃)→ 保留
-                    out[fn[:-5]] = d
-                else:                         # 过期且已关闭 → 归档(可还原),不真删
-                    try:
-                        os.makedirs(ARCHIVE_DIR, exist_ok=True)
-                        os.replace(path, os.path.join(ARCHIVE_DIR, fn))
-                    except OSError:
-                        pass
+            if not is_session_alive(d):       # 终端/窗口都没了(已关闭) → 立刻归档,不论多久没更新
+                try:
+                    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+                    os.replace(path, os.path.join(ARCHIVE_DIR, fn))
+                except OSError:
+                    pass
                 continue
             out[fn[:-5]] = d
         except Exception:
@@ -786,7 +783,7 @@ def run_gui():
         save_config()
 
     timeout_menu = tk.Menu(root, tearoff=0)
-    for sec in (60, 120, 180, 300, 600):
+    for sec in (30, 60, 120, 180, 300, 600):
         timeout_menu.add_radiobutton(label="%d 秒" % sec, value=sec, variable=timeout_var, command=on_set_timeout)
 
     topmost_var = tk.IntVar(value=1)   # 灯窗口默认置顶(原双击切换,易误触 → 改菜单)
