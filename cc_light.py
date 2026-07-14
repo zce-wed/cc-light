@@ -26,6 +26,9 @@ ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")   # 归档被删会话,供「检
 POS_FILE = os.path.join(DATA_DIR, "pos.json")
 MISS_LOG = os.path.join(DATA_DIR, "hook-miss.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+NOTES_FILE = os.path.join(DATA_DIR, "notes.json")                  # 便签/历史窗口几何(位置+大小)
+NOTES_HISTORY_FILE = os.path.join(DATA_DIR, "notes_history.json")  # 快捷记录历史条目数组(末尾最新)
+MAX_HISTORY = 500   # 历史上限(超出截断最旧的)
 STALE = 1 * 3600        # 1 小时无更新 → 归档(可被「检测所有会话」还原)
 SCAN_ACTIVE = 6 * 3600  # 「检测所有会话」:jsonl 6h 内有写入视为会话仍开着(覆盖午休等长空闲)
 DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
@@ -376,6 +379,49 @@ def log_miss(reason, raw):
         pass
 
 
+# ---------------- 快捷记录:历史 / 窗口几何 ----------------
+def load_history():
+    try:
+        with open(NOTES_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_history(items):
+    """原子写历史(末尾最新)。ensure_dir 保证 DATA_DIR 存在。"""
+    try:
+        ensure_dir()
+        tmp = NOTES_HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.replace(tmp, NOTES_HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def load_notes_geo():
+    try:
+        with open(NOTES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_notes_geo(kind, x, y, w, h):
+    """kind: 'note'(便签)或 'history'(历史窗口)。"""
+    try:
+        ensure_dir()
+        d = load_notes_geo()
+        d[kind] = {"x": x, "y": y, "w": w, "h": h}
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
 def usage():
     sys.stderr.write("usage: cc_light.py [--hook color | --end | --set color [msg] | --state]\n")
 
@@ -445,6 +491,146 @@ def set_dpi_aware():
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def set_app_user_model_id(appid):
+    """给进程设独立 AppUserModelID —— 任务栏按 AppID 缓存图标,不设的话会沿用 pythonw.exe 的 python 图标
+    (这是 Python GUI 在 Windows 任务栏显示 python 图标的根因)。必须在创建窗口前调用。"""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [ctypes.c_wchar_p]
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
+    except Exception:
+        pass
+
+
+def frame_to_taskbar(win):
+    """去掉系统标题栏/边框(保自定义 drag bar 外观),但让窗口出现在任务栏 ——
+    这样 win.iconify() 能最小化到任务栏、点任务栏图标能复原(像普通应用)。
+    overrideredirect 窗口是 WS_POPUP 不进任务栏,故用普通 Toplevel + 改样式实现。仅 Windows 有效。"""
+    try:
+        import ctypes
+        win.update_idletasks()
+        u = ctypes.windll.user32
+        u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        u.GetAncestor.restype = ctypes.c_void_p
+        u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.GetWindowLongW.restype = ctypes.c_long
+        u.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        u.SetWindowLongW.restype = ctypes.c_long
+        u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        hwnd = u.GetAncestor(win.winfo_id(), 3) or win.winfo_id()   # GA_ROOTOWNER=3 → 真正的顶层 HWND
+        GWL_STYLE = -16
+        WS_CAPTION = 0x00C00000
+        WS_THICKFRAME = 0x00040000
+        WS_SYSMENU = 0x00080000
+        WS_MAXIMIZEBOX = 0x00010000
+        style = u.GetWindowLongW(hwnd, GWL_STYLE)
+        style &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MAXIMIZEBOX)
+        u.SetWindowLongW(hwnd, GWL_STYLE, style)
+        SWP_NOMOVE = 0x0002; SWP_NOSIZE = 0x0001; SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010; SWP_FRAMECHANGED = 0x0020
+        u.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    except Exception:
+        pass
+
+
+_NOTE_ICON_REF = [None]   # 持有便签图标 PhotoImage,防被 GC(否则任务栏图标变回默认羽毛)
+
+
+def _note_icon():
+    """程序生成的便签图标(32x32):深底融入 Win11 深色任务栏 + 亮黄便签折角 + 三条记录线。
+    需 Tk 已初始化(在 run_gui 内调用)。"""
+    if _NOTE_ICON_REF[0] is not None:
+        return _NOTE_ICON_REF[0]
+    import tkinter
+    W = H = 32
+    bg = "#1f1f22"       # 近 Win11 深色任务栏,任务栏上融入背景
+    note = "#f5a623"     # 交通灯黄
+    fold = "#b9791a"
+    img = tkinter.PhotoImage(width=W, height=H)
+    img.put(bg, to=(0, 0, W, H))
+    img.put(note, to=(6, 5, 26, 26))      # 便签主体
+    img.put(fold, to=(20, 5, 26, 11))     # 右上折角
+    img.put(bg, to=(9, 12, 23, 13))       # 三条横线(记录)
+    img.put(bg, to=(9, 16, 23, 17))
+    img.put(bg, to=(9, 20, 23, 21))
+    _NOTE_ICON_REF[0] = img
+    return img
+
+
+_AUTO_ICO = os.path.join(DATA_DIR, "note-yellow.ico")   # 黄色便签图标缓存 .ico
+
+
+def _make_yellow_note_ico(path, size=32):
+    """生成黄色便签图标 .ico(透明背景 + 亮黄便签折角 + 深色记录线),供 iconbitmap。"""
+    import struct
+    W = H = size
+    NOTE = (0xf5, 0xa6, 0x23)   # 亮黄(交通灯黄)
+    FOLD = (0xb9, 0x79, 0x1a)   # 折角暗黄
+    LINE = (0x2a, 0x2a, 0x2e)   # 记录线深色
+
+    def bgra(x, y):
+        if 6 <= x < 26 and 5 <= y < 26:                 # 便签主体
+            if 20 <= x < 26 and 5 <= y < 11:            # 右上折角
+                r, g, b = FOLD
+            elif 9 <= x < 23 and (12 <= y < 13 or 16 <= y < 17 or 20 <= y < 21):  # 三条记录线
+                r, g, b = LINE
+            else:
+                r, g, b = NOTE
+            return bytes((b, g, r, 255))                # BGRA,不透明
+        return bytes((0, 0, 0, 0))                      # 透明背景
+
+    cb = bytearray()
+    for y in range(H - 1, -1, -1):                      # ICO 位图 bottom-up
+        for x in range(W):
+            cb += bgra(x, y)
+    mask_row = ((W + 31) // 32) * 4
+    dib_header = struct.pack("<IiiHHIIiiII", 40, W, H * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+    dib = dib_header + bytes(cb) + (b"\x00" * (mask_row * H))
+    entry = struct.pack("<BBBBHHII", W, H, 0, 0, 1, 32, len(dib), 22)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<HHH", 0, 1, 1) + entry + dib)
+    return True
+
+
+def _ensure_auto_ico():
+    """生成黄色便签 .ico 到 AppData(缓存,只生成一次),返回路径或 None。"""
+    if os.path.exists(_AUTO_ICO):
+        return _AUTO_ICO
+    try:
+        ensure_dir()
+        if _make_yellow_note_ico(_AUTO_ICO):
+            return _AUTO_ICO
+    except Exception:
+        pass
+    return None
+
+
+def _set_note_icon(win):
+    """任务栏图标,优先级:note.ico > 黄色便签 ico(iconbitmap)> iconphoto 兜底。
+    iconbitmap 是 tkinter 原生,配合 AppUserModelID 任务栏会正确显示(不回退 python)。"""
+    try:
+        ico = os.path.join(DIR, "note.ico")
+        if os.path.exists(ico):
+            win.iconbitmap(ico)                       # 用户自备 ico,最高优先
+            return
+    except Exception:
+        pass
+    auto = _ensure_auto_ico()
+    if auto:
+        try:
+            win.iconbitmap(auto)                      # 黄色便签图标(iconbitmap)
+            return
+        except Exception:
+            pass
+    try:
+        win.iconphoto(True, _note_icon())             # 兜底:程序生成图标
     except Exception:
         pass
 
@@ -607,6 +793,7 @@ def round_rect(cv, x0, y0, x1, y1, r, **kw):
 def run_gui():
     import tkinter as tk
     set_dpi_aware()
+    set_app_user_model_id("cc-light.NotePad")   # 独立 AppID:任务栏按它缓存图标,不再沿用 pythonw 的 python 图标
 
     W, H = 52, 150
     R_LAMP = 12
@@ -996,9 +1183,306 @@ def run_gui():
     def on_toggle_topmost():
         root.attributes("-topmost", bool(topmost_var.get()))
 
+    # ---------------- 快捷记录:悬浮便签 + 历史 ----------------
+    note_win = [None]          # 当前便签 Toplevel(单例;已开则前置聚焦)
+    note_text = [None]         # 便签内的 Text 控件
+    hist_win = [None]          # 历史窗口(单例;重复打开只保留一个)
+    NOTE_MIN_W, NOTE_MIN_H = 240, 140
+
+    def _close_note():
+        """关闭便签:关闭即存(内容非空且与最新一条不同 → 归档)+ 去重 + 存几何。"""
+        if note_text[0] is not None:
+            try:
+                t = note_text[0].get("1.0", "end-1c").strip()
+            except Exception:
+                t = ""
+            if t:
+                hist = load_history()
+                if not hist or hist[-1].get("text") != t:    # 与最新一条相同则不重复存
+                    hist.append({"ts": time.time(), "text": t})
+                    save_history(hist[-MAX_HISTORY:])
+        if note_win[0] is not None:
+            try:
+                save_notes_geo("note", note_win[0].winfo_x(), note_win[0].winfo_y(),
+                               note_win[0].winfo_width(), note_win[0].winfo_height())
+            except Exception:
+                pass
+            try:
+                note_win[0].destroy()
+            except Exception:
+                pass
+        note_win[0] = None
+        note_text[0] = None
+
+    def toggle_note():
+        """打开/前置便签。已开(含任务栏最小化态)→ 复原+前置聚焦;未开 → 新建空便签。"""
+        if note_win[0] is not None and note_win[0].winfo_exists():
+            try:
+                if note_win[0].wm_state() == "iconic":    # 任务栏最小化态 → 复原
+                    note_win[0].deiconify()
+                    note_win[0].attributes("-topmost", True)
+                note_win[0].lift()
+                note_win[0].attributes("-topmost", True)
+                note_win[0].focus_force()
+            except Exception:
+                pass
+            return
+        win = tk.Toplevel(root)
+        win.configure(bg=BG)
+        win.title("快捷记录")
+        try:
+            win.attributes("-alpha", 0.98)
+        except Exception:
+            pass
+
+        geo = load_notes_geo().get("note")
+        if geo:
+            win.geometry("%dx%d+%d+%d" % (geo.get("w", 300), geo.get("h", 220),
+                                          geo.get("x", 0), geo.get("y", 0)))
+        else:
+            win.geometry("%dx%d+%d+%d" % (300, 220, root.winfo_rootx() + W + 6,
+                                          max(0, root.winfo_rooty())))
+        win.update_idletasks()
+        frame_to_taskbar(win)               # 去系统标题栏(保自定义外观)+ 进任务栏(可最小化/点任务栏复原)
+        _set_note_icon(win)                 # 任务栏图标(note.ico 优先,否则程序生成的便签图标)
+        win.attributes("-topmost", True)
+
+        # 顶部 drag bar(空白区 + 标题可拖动整窗;↻ 记录并清空、— 最小化、✕ 关闭)
+        bar = tk.Frame(win, bg=BORDER, height=26)
+        bar.pack(side="top", fill="x")
+        bar.pack_propagate(False)
+        title_lbl = tk.Label(bar, text=" 快捷记录", fg="#cfcfcf", bg=BORDER,
+                             font=("Microsoft YaHei", 9))
+        title_lbl.pack(side="left", padx=2)
+        BTN_FONT = ("Segoe UI Symbol", 11)
+        close_btn = tk.Label(bar, text="✕", fg="#9a9a9a", bg=BORDER, font=BTN_FONT, padx=8)
+        close_btn.pack(side="right")
+        min_btn = tk.Label(bar, text="—", fg="#9a9a9a", bg=BORDER, font=BTN_FONT, padx=8)
+        min_btn.pack(side="right")
+        refresh_btn = tk.Label(bar, text="↻", fg="#9a9a9a", bg=BORDER, font=BTN_FONT, padx=8)
+        refresh_btn.pack(side="right")
+        for _b in (close_btn, min_btn, refresh_btn):
+            _b.configure(cursor="arrow")
+            _b.bind("<Enter>", lambda e, w=_b: w.configure(fg="#ffffff"))   # hover 变亮
+            _b.bind("<Leave>", lambda e, w=_b: w.configure(fg="#9a9a9a"))
+
+        # 多行输入区
+        txt = tk.Text(win, bg=BG, fg="#e8e8e8", insertbackground="#e8e8e8",
+                      bd=0, highlightthickness=0, wrap="word", relief="flat",
+                      font=("Microsoft YaHei", 10), padx=8, pady=6, spacing1=2, spacing3=2)
+        txt.pack(side="top", fill="both", expand=True)
+
+        # 右下角缩放手柄
+        handle = tk.Label(win, text="◢", fg="#6a6a72", bg=BG, font=("Consolas", 11))
+        handle.place(relx=1.0, rely=1.0, x=-3, y=-3, anchor="se")
+        handle.configure(cursor="size_nw_se")
+
+        note_win[0] = win
+        note_text[0] = txt
+
+        # 拖动整窗(bar 空白区 + 标题触发;✕ 只绑关闭)。
+        # 关键:用 e.x_root(屏幕绝对坐标)+ bind_all —— bar 内有 title_lbl/close_btn 子控件,
+        # 鼠标划过子控件时 e.x(相对坐标)基准会变导致跳动;bind_all 让按下后全局接管 Motion,不丢帧。
+        drag = {"x": 0, "y": 0, "wx": 0, "wy": 0}
+        def _save_geo(_e=None):
+            try:
+                save_notes_geo("note", win.winfo_x(), win.winfo_y(),
+                               win.winfo_width(), win.winfo_height())
+            except Exception:
+                pass
+        def _d_move(e):
+            win.geometry("+%d+%d" % (drag["wx"] + e.x_root - drag["x"], drag["wy"] + e.y_root - drag["y"]))
+        def _d_up(e):
+            win.unbind_all("<B1-Motion>")
+            win.unbind_all("<ButtonRelease-1>")
+            _save_geo()
+        def _d_down(e):
+            drag["x"], drag["y"] = e.x_root, e.y_root
+            drag["wx"], drag["wy"] = win.winfo_x(), win.winfo_y()
+            win.bind_all("<B1-Motion>", _d_move)
+            win.bind_all("<ButtonRelease-1>", _d_up)
+        for _w in (bar, title_lbl):
+            _w.bind("<ButtonPress-1>", _d_down)
+            _w.configure(cursor="fleur")
+        def _commit_and_clear():
+            """记录当前内容到历史(去重)+ 清空便签,窗口保持开着继续写下一条。"""
+            try:
+                t = note_text[0].get("1.0", "end-1c").strip()
+            except Exception:
+                t = ""
+            if t:
+                hist = load_history()
+                if not hist or hist[-1].get("text") != t:    # 与最新一条相同则不重复存
+                    hist.append({"ts": time.time(), "text": t})
+                    save_history(hist[-MAX_HISTORY:])
+            try:
+                note_text[0].delete("1.0", "end")
+                note_text[0].focus_set()
+            except Exception:
+                pass
+        def _minimize_note():
+            try:
+                save_notes_geo("note", win.winfo_x(), win.winfo_y(),
+                               win.winfo_width(), win.winfo_height())
+            except Exception:
+                pass
+            try:
+                win.iconify()              # 最小化到任务栏;点任务栏图标或再点「快捷记录」复原
+            except Exception:
+                pass
+        refresh_btn.bind("<Button-1>", lambda e: _commit_and_clear())
+        min_btn.bind("<Button-1>", lambda e: _minimize_note())
+        close_btn.bind("<Button-1>", lambda e: _close_note())
+
+        # 右下角缩放(同样 bind_all:窗口缩小时 ◢ 跟着移,鼠标可能脱离 handle,全局接管不卡)
+        rsz = {"sx": 0, "sy": 0, "w": 0, "h": 0}
+        def _r_move(e):
+            nw = max(NOTE_MIN_W, rsz["w"] + (e.x_root - rsz["sx"]))
+            nh = max(NOTE_MIN_H, rsz["h"] + (e.y_root - rsz["sy"]))
+            win.geometry("%dx%d" % (nw, nh))
+        def _r_up(e):
+            win.unbind_all("<B1-Motion>")
+            win.unbind_all("<ButtonRelease-1>")
+            _save_geo()
+        def _r_down(e):
+            rsz["sx"], rsz["sy"] = e.x_root, e.y_root
+            rsz["w"], rsz["h"] = win.winfo_width(), win.winfo_height()
+            win.bind_all("<B1-Motion>", _r_move)
+            win.bind_all("<ButtonRelease-1>", _r_up)
+        handle.bind("<ButtonPress-1>", _r_down)
+
+        win.bind("<Escape>", lambda e: _close_note())
+        txt.bind("<Escape>", lambda e: _close_note())
+        txt.focus_set()
+
+    def fill_note(text):
+        """把内容回填到便签(便签没开就先打开并前置),聚焦方便继续编辑。"""
+        toggle_note()
+        try:
+            if note_text[0] is not None:
+                note_text[0].delete("1.0", "end")
+                note_text[0].insert("1.0", text)
+                note_text[0].focus_set()
+        except Exception:
+            pass
+
+    def show_history():
+        """快捷记录历史:列表展示所有记录(最新在上),左键回填便签,右键删除。单例,重复打开只留一个。"""
+        if hist_win[0] is not None:           # 单例:旧的先销毁,避免开出一堆
+            try:
+                hist_win[0].destroy()
+            except Exception:
+                pass
+            hist_win[0] = None
+        items = list(reversed(load_history()))
+        win = tk.Toplevel(root)
+        win.title("快捷记录历史")
+        win.attributes("-topmost", True)
+        win.configure(bg=BG)
+        _set_note_icon(win)
+        hist_win[0] = win
+        geo = load_notes_geo().get("history")
+        if geo:
+            win.geometry("%dx%d+%d+%d" % (geo.get("w", 360), geo.get("h", 420),
+                                          geo.get("x", 0), geo.get("y", 0)))
+        else:
+            win.geometry("%dx%d+%d+%d" % (360, 420, root.winfo_rootx() + W + 6,
+                                          max(0, root.winfo_rooty())))
+
+        tk.Label(win, text=" 快捷记录历史(%d 条)" % len(items), fg="#9a9a9a", bg=BG,
+                 font=("Microsoft YaHei", 9)).pack(side="top", fill="x", padx=6, pady=(6, 4))
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 6))
+        cv = tk.Canvas(body, bg=BG, bd=0, highlightthickness=0)
+        sb = tk.Scrollbar(body, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(cv, bg=BG)
+        inner_win = cv.create_window((0, 0), window=inner, anchor="nw")
+        t_labels = []
+
+        def _on_inner_cfg(_e):
+            cv.configure(scrollregion=cv.bbox("all"))
+        def _on_cv_cfg(e):
+            cv.itemconfig(inner_win, width=e.width)
+            wl = max(120, e.width - 70)           # 减「时间标签 + padding」,让预览自适应窗口宽
+            for lbl in t_labels:
+                try:
+                    lbl.configure(wraplength=wl)
+                except Exception:
+                    pass
+        inner.bind("<Configure>", _on_inner_cfg)
+        cv.bind("<Configure>", _on_cv_cfg)
+
+        def _wheel(e):
+            try:
+                cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+        def _unbind_wheel(_e=None):
+            try:
+                cv.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
+        cv.bind("<Enter>", lambda e: cv.bind_all("<MouseWheel>", _wheel))
+        cv.bind("<Leave>", _unbind_wheel)
+        win.bind("<Destroy>", _unbind_wheel, add="+")
+
+        if not items:
+            tk.Label(inner, text="(无记录)", fg="#888888", bg=BG,
+                     font=("Microsoft YaHei", 9)).pack(anchor="w", padx=4, pady=8)
+        else:
+            for it in items:
+                ts = it.get("ts", 0)
+                text = it.get("text", "")
+                row = tk.Frame(inner, bg=BG)
+                row.pack(side="top", fill="x", padx=2, pady=2)
+                flat = " ".join(text.split())
+                preview = flat[:14] + (" …" if (len(flat) > 14 or "\n" in text) else "")
+                tk.Label(row, text=human_ago(ts), fg="#777777", bg=BG,
+                         font=("Consolas", 7)).pack(side="left", padx=(2, 6))
+                t_lbl = tk.Label(row, text=preview, fg="#dddddd", bg=BG,
+                                 font=("Microsoft YaHei", 9), wraplength=300, justify="left")
+                t_lbl.pack(side="left", fill="x", expand=True)
+                t_labels.append(t_lbl)
+                row.configure(cursor="hand2")
+                t_lbl.configure(cursor="hand2")
+
+                def _click(e, tx=text):
+                    fill_note(tx)
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                def _right(e, _ts=ts, _tx=text):
+                    m = tk.Menu(root, tearoff=0, bg=BG, fg="#dddddd",
+                                activebackground="#3a3a3a", activeforeground="#ffffff")
+                    def _do():
+                        save_history([x for x in load_history()
+                                      if not (x.get("ts") == _ts and x.get("text") == _tx)])
+                        try:
+                            win.destroy()
+                        except Exception:
+                            pass
+                        show_history()
+                    m.add_command(label="删除该记录", command=_do)
+                    try:
+                        m.tk_popup(e.x_root, e.y_root)
+                    finally:
+                        m.grab_release()
+                row.bind("<Button-1>", _click)
+                t_lbl.bind("<Button-1>", _click)
+                row.bind("<Button-3>", _right)
+                t_lbl.bind("<Button-3>", _right)
+
     menu = tk.Menu(root, tearoff=0)
     menu.add_command(label="清理不活跃会话", command=cleanup_stale)
     menu.add_command(label="检测所有会话", command=restore_sessions)   # 还原被清理/删除的会话
+    menu.add_separator()
+    menu.add_command(label="快捷记录", command=toggle_note)
+    menu.add_command(label="快捷记录历史", command=show_history)
     menu.add_separator()
     menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
     menu.add_cascade(label="超时时间", menu=timeout_menu)
