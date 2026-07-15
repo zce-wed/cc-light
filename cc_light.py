@@ -7,7 +7,6 @@ cc-light —— Claude Code 桌面悬浮交通灯(多会话优先级聚合)
   pythonw cc_light.py                              启动悬浮灯窗口
   python  cc_light.py --hook red|yellow|green      hook 用:读 stdin 取 session_id/cwd
   python  cc_light.py --end                        SessionEnd 用:删该会话
-  python  cc_light.py --set red|yellow|green|gray  手动:写/清 _manual 会话
   python  cc_light.py --state                      打印聚合态 + 会话数
 
 聚合:任一 red > 任一 yellow > 任一 green > gray
@@ -451,7 +450,7 @@ def save_notes_geo(kind, x, y, w, h):
 
 
 def usage():
-    sys.stderr.write("usage: cc_light.py [--hook color | --end | --set color [msg] | --state]\n")
+    sys.stderr.write("usage: cc_light.py [--hook color | --end | --state]\n")
 
 
 # ---------------- CLI ----------------
@@ -481,15 +480,6 @@ def cli():
         sid = d.get("session_id")
         if sid:
             delete_session(sid)
-        return 0
-    if a[0] == "--set":
-        if len(a) < 2 or (a[1] not in COLORS and a[1] != "gray"):
-            usage()
-            return 2
-        if a[1] == "gray":
-            delete_session("_manual")
-        else:
-            write_session("_manual", a[1], a[2] if len(a) > 2 else "", "手动")
         return 0
     usage()
     return 2
@@ -1333,7 +1323,9 @@ def run_gui():
         min_btn.pack(side="right")
         refresh_btn = tk.Label(bar, text="↻", fg="#9a9a9a", bg=BORDER, font=BTN_FONT, padx=8)
         refresh_btn.pack(side="right")
-        for _b in (close_btn, min_btn, refresh_btn):
+        hist_btn = tk.Label(bar, text="☰", fg="#9a9a9a", bg=BORDER, font=BTN_FONT, padx=8)   # 历史记录
+        hist_btn.pack(side="right")
+        for _b in (close_btn, min_btn, refresh_btn, hist_btn):
             _b.configure(cursor="arrow")
             _b.bind("<Enter>", lambda e, w=_b: w.configure(fg="#ffffff"))   # hover 变亮
             _b.bind("<Leave>", lambda e, w=_b: w.configure(fg="#9a9a9a"))
@@ -1403,6 +1395,7 @@ def run_gui():
             except Exception:
                 pass
         refresh_btn.bind("<Button-1>", lambda e: _commit_and_clear())
+        hist_btn.bind("<Button-1>", lambda e: show_history())   # ☰ → 打开历史记录
         min_btn.bind("<Button-1>", lambda e: _minimize_note())
         close_btn.bind("<Button-1>", lambda e: _close_note())
 
@@ -1453,13 +1446,22 @@ def run_gui():
         win.configure(bg=BG)
         _set_note_icon(win)
         hist_win[0] = win
-        geo = load_notes_geo().get("history")
-        if geo:
-            win.geometry("%dx%d+%d+%d" % (geo.get("w", 360), geo.get("h", 420),
-                                          geo.get("x", 0), geo.get("y", 0)))
-        else:
-            win.geometry("%dx%d+%d+%d" % (360, 420, root.winfo_rootx() + W + 6,
-                                          max(0, root.winfo_rooty())))
+        # 高度按条目数自适应(少则矮、多则封顶 460 配滚动条);位置跟着便签走(便签右侧、顶部对齐)
+        nw, nh = 360, max(110, min(56 + len(items) * 30, 460))
+        nx, ny = root.winfo_rootx() + W + 6, max(0, root.winfo_rooty())   # 兜底:灯窗口旁
+        if note_win[0] is not None and note_win[0].winfo_exists():
+            try:
+                nx = note_win[0].winfo_rootx() + note_win[0].winfo_width() + 6
+                ny = note_win[0].winfo_rooty()
+            except Exception:
+                pass
+        if nx + nw > win.winfo_screenwidth() - 6:   # 超右屏 → 改放便签左侧
+            try:
+                nx = note_win[0].winfo_rootx() - nw - 6
+            except Exception:
+                nx = max(0, win.winfo_screenwidth() - nw - 6)
+        win.geometry("%dx%d+%d+%d" % (nw, nh, max(0, nx), max(0, ny)))
+        win.update_idletasks()
 
         tk.Label(win, text=" 快捷记录历史(%d 条)" % len(items), fg="#9a9a9a", bg=BG,
                  font=("Microsoft YaHei", 9)).pack(side="top", fill="x", padx=6, pady=(6, 4))
@@ -1469,14 +1471,26 @@ def run_gui():
         cv = tk.Canvas(body, bg=BG, bd=0, highlightthickness=0)
         sb = tk.Scrollbar(body, orient="vertical", command=cv.yview)
         cv.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        cv.pack(side="left", fill="both", expand=True)
+        cv.pack(side="left", fill="both", expand=True)   # sb 按需 pack(_sync_sb):内容少时不显示滚动条
         inner = tk.Frame(cv, bg=BG)
         inner_win = cv.create_window((0, 0), window=inner, anchor="nw")
         t_labels = []
 
-        def _on_inner_cfg(_e):
+        def _sync_sb(vis_h):
+            """内容高度超出可视区才显示滚动条,否则隐藏。"""
             cv.configure(scrollregion=cv.bbox("all"))
+            bbox = cv.bbox("all")
+            content_h = (bbox[3] - bbox[1]) if bbox else 0
+            need = content_h > vis_h + 2
+            try:
+                if need and not sb.winfo_ismapped():
+                    sb.pack(side="right", fill="y")
+                elif not need and sb.winfo_ismapped():
+                    sb.pack_forget()
+            except Exception:
+                pass
+        def _on_inner_cfg(_e):
+            _sync_sb(cv.winfo_height())
         def _on_cv_cfg(e):
             cv.itemconfig(inner_win, width=e.width)
             wl = max(120, e.width - 70)           # 减「时间标签 + padding」,让预览自适应窗口宽
@@ -1485,8 +1499,10 @@ def run_gui():
                     lbl.configure(wraplength=wl)
                 except Exception:
                     pass
+            _sync_sb(e.height)
         inner.bind("<Configure>", _on_inner_cfg)
         cv.bind("<Configure>", _on_cv_cfg)
+        win.after(120, lambda: _sync_sb(cv.winfo_height()))   # 初次布局后再核一次(防 Configure 时机漏判)
 
         def _wheel(e):
             try:
@@ -1554,15 +1570,9 @@ def run_gui():
     menu.add_command(label="检测所有会话", command=restore_sessions)   # 还原被清理/删除的会话
     menu.add_separator()
     menu.add_command(label="快捷记录", command=toggle_note)
-    menu.add_command(label="快捷记录历史", command=show_history)
     menu.add_separator()
     menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
     menu.add_cascade(label="超时时间", menu=timeout_menu)
-    menu.add_separator()
-    menu.add_command(label="手动 · 红(等确认)", command=lambda: write_session("_manual", "red", "", "手动"))
-    menu.add_command(label="手动 · 黄(运行中)", command=lambda: write_session("_manual", "yellow", "", "手动"))
-    menu.add_command(label="手动 · 绿(完成)",   command=lambda: write_session("_manual", "green", "", "手动"))
-    menu.add_command(label="手动 · 清除",       command=lambda: delete_session("_manual"))
     def restart():
         import subprocess
         try:
