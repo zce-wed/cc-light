@@ -1491,8 +1491,20 @@ def run_gui():
         win.geometry("%dx%d+%d+%d" % (nw, nh, max(0, nx), max(0, ny)))
         win.update_idletasks()
 
-        tk.Label(win, text=" 快捷记录历史(%d 条)" % len(items), fg="#9a9a9a", bg=BG,
-                 font=("Microsoft YaHei", 9)).pack(side="top", fill="x", padx=6, pady=(6, 4))
+        rows = []                # [(it, row_frame, ptxt), ...]
+        ph = {"on": True}        # 搜索框 placeholder 状态
+        entry = None
+        title_lbl = None
+        if items:
+            top = tk.Frame(win, bg=BG)
+            top.pack(side="top", fill="x", padx=6, pady=(6, 4))
+            title_lbl = tk.Label(top, text=" 快捷记录历史(共 %d 条)" % len(items),
+                                 fg="#9a9a9a", bg=BG, font=("Microsoft YaHei", 9))
+            title_lbl.pack(side="top", anchor="w")
+            entry = tk.Entry(win, bg="#2a2a2a", fg="#777777", insertbackground="#e8e8e8",
+                             relief="flat", bd=0, font=("Microsoft YaHei", 9))
+            entry.insert(0, "搜索…")
+            entry.pack(side="top", fill="x", padx=6, pady=(0, 4))
 
         body = tk.Frame(win, bg=BG)
         body.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 6))
@@ -1502,7 +1514,6 @@ def run_gui():
         cv.pack(side="left", fill="both", expand=True)   # sb 按需 pack(_sync_sb):内容少时不显示滚动条
         inner = tk.Frame(cv, bg=BG)
         inner_win = cv.create_window((0, 0), window=inner, anchor="nw")
-        t_labels = []
 
         def _sync_sb(vis_h):
             """内容高度超出可视区才显示滚动条,否则隐藏。"""
@@ -1517,16 +1528,20 @@ def run_gui():
                     sb.pack_forget()
             except Exception:
                 pass
+        def _resize_text(t):
+            try:
+                t.update_idletasks()
+                r = t.count("1.0", "end-1c", "displaylines")
+                t.config(height=max(1, r[0] if r else 1))
+            except Exception:
+                pass
         def _on_inner_cfg(_e):
             _sync_sb(cv.winfo_height())
         def _on_cv_cfg(e):
             cv.itemconfig(inner_win, width=e.width)
-            wl = max(120, e.width - 70)           # 减「时间标签 + padding」,让预览自适应窗口宽
-            for lbl in t_labels:
-                try:
-                    lbl.configure(wraplength=wl)
-                except Exception:
-                    pass
+            for _it, _row, _ptxt in rows:
+                if _row.winfo_ismapped():
+                    _resize_text(_ptxt)
             _sync_sb(e.height)
         inner.bind("<Configure>", _on_inner_cfg)
         cv.bind("<Configure>", _on_cv_cfg)
@@ -1546,6 +1561,9 @@ def run_gui():
         cv.bind("<Leave>", _unbind_wheel)
         win.bind("<Destroy>", _unbind_wheel, add="+")
 
+        nomatch_lbl = tk.Label(inner, text="(无匹配记录)", fg="#888888", bg=BG,
+                               font=("Microsoft YaHei", 9))
+
         if not items:
             tk.Label(inner, text="(无记录)", fg="#888888", bg=BG,
                      font=("Microsoft YaHei", 9)).pack(anchor="w", padx=4, pady=8)
@@ -1555,16 +1573,16 @@ def run_gui():
                 text = it.get("text", "")
                 row = tk.Frame(inner, bg=BG)
                 row.pack(side="top", fill="x", padx=2, pady=2)
-                flat = " ".join(text.split())
-                preview = flat[:14] + (" …" if (len(flat) > 14 or "\n" in text) else "")
                 tk.Label(row, text=human_ago(ts), fg="#777777", bg=BG,
                          font=("Consolas", 7)).pack(side="left", padx=(2, 6))
-                t_lbl = tk.Label(row, text=preview, fg="#dddddd", bg=BG,
-                                 font=("Microsoft YaHei", 9), wraplength=300, justify="left")
-                t_lbl.pack(side="left", fill="x", expand=True)
-                t_labels.append(t_lbl)
+                ptxt = tk.Text(row, bg=BG, fg="#dddddd", bd=0, highlightthickness=0,
+                               wrap="word", font=("Microsoft YaHei", 9), height=1,
+                               padx=0, pady=0, cursor="hand2")
+                ptxt.pack(side="left", fill="x", expand=True)
+                ptxt.tag_configure("hl", background="#6a5a1a", foreground="#ffffff")
+                ptxt.insert("1.0", preview_snippet(text, "")[0])
+                ptxt.config(state="disabled")
                 row.configure(cursor="hand2")
-                t_lbl.configure(cursor="hand2")
 
                 def _click(e, tx=text):
                     fill_note(tx)
@@ -1589,9 +1607,62 @@ def run_gui():
                     finally:
                         m.grab_release()
                 row.bind("<Button-1>", _click)
-                t_lbl.bind("<Button-1>", _click)
+                ptxt.bind("<Button-1>", _click)
                 row.bind("<Button-3>", _right)
-                t_lbl.bind("<Button-3>", _right)
+                ptxt.bind("<Button-3>", _right)
+                rows.append((it, row, ptxt))
+
+            def _apply_filter(query):
+                q = (query or "").strip()
+                if ph["on"]:                 # placeholder 态(「搜索…」)→ 视为空 query
+                    q = ""
+                matched = 0
+                for it, row, ptxt in rows:
+                    text = it.get("text", "")
+                    if match_record(text, q):
+                        if not row.winfo_ismapped():
+                            row.pack(side="top", fill="x", padx=2, pady=2)
+                        matched += 1
+                        snippet, spans = preview_snippet(text, q)
+                        ptxt.config(state="normal")
+                        ptxt.delete("1.0", "end")
+                        ptxt.insert("1.0", snippet or "")
+                        ptxt.tag_remove("hl", "1.0", "end")
+                        for a, b in spans:
+                            ptxt.tag_add("hl", "1.0+%dc" % a, "1.0+%dc" % b)
+                        ptxt.config(state="disabled")
+                        _resize_text(ptxt)
+                    else:
+                        if row.winfo_ismapped():
+                            row.pack_forget()
+                if title_lbl is not None:
+                    if q:
+                        title_lbl.config(text=" 快捷记录历史 · 匹配 %d / 共 %d 条" % (matched, len(rows)))
+                    else:
+                        title_lbl.config(text=" 快捷记录历史(共 %d 条)" % len(rows))
+                if q and matched == 0:
+                    nomatch_lbl.pack(side="top", anchor="w", padx=4, pady=8)
+                else:
+                    nomatch_lbl.pack_forget()
+                _sync_sb(cv.winfo_height())
+            def _on_focusin(_e):
+                if ph["on"]:
+                    entry.delete(0, "end")
+                    entry.config(fg="#e8e8e8")
+                    ph["on"] = False
+            def _on_key(_e):
+                ph["on"] = False
+                _apply_filter(entry.get())
+            def _on_esc(_e):
+                entry.delete(0, "end")
+                ph["on"] = True
+                entry.insert(0, "搜索…")
+                entry.config(fg="#777777")
+                _apply_filter("")
+            entry.bind("<FocusIn>", _on_focusin)
+            entry.bind("<KeyRelease>", _on_key)
+            entry.bind("<Escape>", _on_esc)
+            win.after(150, lambda: _apply_filter(""))   # 布局后初始化预览高度 + 计数
 
     menu = tk.Menu(root, tearoff=0)
     menu.add_command(label="清理不活跃会话", command=cleanup_stale)
