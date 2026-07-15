@@ -428,6 +428,34 @@ def save_history(items):
         pass
 
 
+def match_record(text, query):
+    """记录 text 是否匹配搜索 query(不区分大小写子串;空 query 恒匹配)。"""
+    if not query:
+        return True
+    return query.lower() in " ".join(text.split()).lower()
+
+
+def preview_snippet(text, query, head=14, ctx=8):
+    """生成历史预览片段 + 命中区间(相对片段,用于 Text 高亮)。
+    空 query:返回压平后前 head 字(超长补 ' …'),空区间。
+    有 query 且命中:返回命中词前后各 ctx 字的片段(头尾按需补 '…'),1 个区间。
+    未命中:返回 (None, []) —— 调用方应先用 match_record 过滤。"""
+    flat = " ".join(text.split())
+    if not query:
+        snippet = flat[:head] + (" …" if len(flat) > head else "")
+        return snippet, []
+    fl = flat.lower()
+    idx = fl.find(query.lower())
+    if idx < 0:
+        return None, []
+    start = max(0, idx - ctx)
+    end = min(len(flat), idx + len(query) + ctx)
+    span_off = 1 if start > 0 else 0       # 头部 '…' 占 1 字符,命中区间随之偏移
+    snippet = ("…" if start > 0 else "") + flat[start:end] + ("…" if end < len(flat) else "")
+    span_start = (idx - start) + span_off
+    return snippet, [(span_start, span_start + len(query))]
+
+
 def load_notes_geo():
     try:
         with open(NOTES_FILE, "r", encoding="utf-8") as f:
