@@ -87,13 +87,16 @@ if (!sid) {
 const cwd = d.cwd || '';
 const base = cwd.replace(/\\/g, '/').replace(/\/$/, '').split('/').pop();
 const name = base || String(sid).slice(0, 8);
+// name 始终用当前 cwd 的 basename(每次重算,不继承 old.name):「检测所有会话」补建的 scanned 会话
+// 曾用 proj_name(含父目录)写 name,hook 接管若继承会固化这个污染值,而窗口标题只含 basename →
+// hwnd 失效后 _jump 兜底 find_window_by_name 匹配不到标题,跳不动。见 cc_light.py scan_active_jsonl。
 const now = Date.now() / 1000;
 
 // subagent start: subs+1, write yellow (a subagent running => the session is busy)
 if (action === 'sub_start') {
     const old = readSession(sid) || {};
     const meta = getMeta(old.hwnd, old.termpid);
-    writeSession(sid, { state: 'yellow', msg: '', ts: now, name: old.name || name, subs: (old.subs || 0) + 1, hwnd: meta.hwnd || old.hwnd || 0, termpid: meta.termpid || old.termpid || 0 });
+    writeSession(sid, { state: 'yellow', msg: '', ts: now, name: name, subs: (old.subs || 0) + 1, hwnd: meta.hwnd || old.hwnd || 0, termpid: meta.termpid || old.termpid || 0 });
     process.exit(0);
 }
 // subagent stop: subs-1, do NOT change state (the main agent may spawn another subagent)
@@ -121,7 +124,7 @@ writeSession(sid, {
     state: action,
     msg: '',
     ts: now,
-    name: (old && old.name) || name,
+    name: name,
     subs: (old && old.subs) || 0,
     hwnd: meta.hwnd || (old && old.hwnd) || 0,
     termpid: meta.termpid || (old && old.termpid) || 0,

@@ -249,7 +249,10 @@ def scan_active_jsonl(threshold_sec):
         cands.sort(reverse=True)                  # 最新在前
         n = len(terms)
         for idx, (mtime, sid) in enumerate(cands[:n]):   # 取最新 n 个(= 进程数)
-            out[sid] = {"name": proj_name(proj), "mtime": mtime,
+            # name 用 basename(cwd 末段,如 zcvip-front),与 hook 写的 name、_jump 兜底匹配的窗口标题
+            # (file - zcvip-front - Trae CN 只含 basename)三方一致。曾用 proj_name(含父目录,如
+            # Desktop-newWork-zcvip-front):匹配不了标题,hwnd 失效后 _jump 兜底全失败 → 跳不动。
+            out[sid] = {"name": proj_leaf.get(pl, "") or proj_name(proj), "mtime": mtime,
                         "termpid": terms[idx % n],         # round-robin 终端 pid(独立终端窗口场景;同项目多终端无法 1:1 精确)
                         "hwnd": host_hwnd or 0,            # 宿主窗口(Trae/VSCode:同项目会话共享一个,点击 focus 它)
                         "jsonl": os.path.join(pdir, sid + ".jsonl")}  # scanned 会话按其 mtime 判忙/闲
