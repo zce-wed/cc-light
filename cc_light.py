@@ -896,6 +896,45 @@ def find_window_by_pid(pid):
         return None
 
 
+def _window_process_name(hwnd):
+    """窗口所属进程的可执行文件名(如 'Trae CN.exe'/'WindowsTerminal.exe')。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        v = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(v))
+        pid = int(v.value)
+        if not pid:
+            return ""
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        h = k.OpenProcess(0x1000, False, pid)            # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(260); n = wintypes.DWORD(260)
+            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return os.path.basename(buf.value)
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
+def _is_trae_wnd(hwnd):
+    """窗口是否属于 Trae 进程。trae-cn:// URI 只该对 Trae 多终端发:WT 多 tab 也共享宿主窗口 hwnd,
+    误判 shared 发 URI → Trae helper 兜底 workbench.action.terminal.focus 激活 Trae 抢前台,把刚 focus
+    的 WT 挤走(表现为「点 WT 会话,窗口出来几秒后又最小化」)。"""
+    return "trae" in _window_process_name(hwnd).lower()
+
+
 def resolve_hwnd(hwnd, name):
     """优先用记录的 hwnd;窗口已失效(重建/reload)则按项目名兜底匹配当前可见窗口。"""
     try:
@@ -1192,7 +1231,7 @@ def run_gui():
                         tgt = find_window_by_pid(tp)
                     if tgt:
                         focus_window(tgt)               # 聚焦宿主/终端窗口
-                    if tp and shared:                   # 同窗口多终端 → 额外发 URI 精确切到对应终端
+                    if tp and shared and _is_trae_wnd(tgt):   # 仅 Trae 多终端发 URI 精确切;WT 多 tab 共享 hwnd 但无 URI,发了反激活 Trae 抢前台
                         try:
                             os.startfile("trae-cn://cc-light.cc-light-helper/focus?pid=" + str(tp))
                         except Exception:
