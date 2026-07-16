@@ -8,6 +8,7 @@ cc-light —— Claude Code 桌面悬浮交通灯(多会话优先级聚合)
   python  cc_light.py --hook red|yellow|green      hook 用:读 stdin 取 session_id/cwd
   python  cc_light.py --end                        SessionEnd 用:删该会话
   python  cc_light.py --state                      打印聚合态 + 会话数
+  python  cc_light.py --diag                       自检:打印每个会话能否定位窗口(诊断点击跳不动)
 
 聚合:任一 red > 任一 yellow > 任一 green > gray
 """
@@ -227,7 +228,9 @@ def scan_active_jsonl(threshold_sec):
         terms = proj_terms.get(pl)
         if not terms:                             # 该项目无活 claude 进程 → 跳过
             continue
-        host_hwnd = find_window_by_name(proj_leaf.get(pl, ""))   # Trae/VSCode 宿主窗口(标题含项目 basename)
+        # 宿主窗口:优先沿 termpid 父链找(termpid=powershell 无窗口,窗口在祖父 WT/Trae 主进程;
+        # WT 多 tab 标题随前台 tab 变、记录的 hwnd 易失效,按进程归属更稳)。找不到再按 basename 匹配标题。
+        host_hwnd = (find_window_by_pid(terms[0]) if terms else None) or find_window_by_name(proj_leaf.get(pl, ""))
         pdir = os.path.join(base, proj)
         if not os.path.isdir(pdir):
             continue
@@ -481,14 +484,57 @@ def save_notes_geo(kind, x, y, w, h):
 
 
 def usage():
-    sys.stderr.write("usage: cc_light.py [--hook color | --end | --state]\n")
+    sys.stderr.write("usage: cc_light.py [--hook color | --end | --state | --diag]\n")
 
 
 # ---------------- CLI ----------------
+def diag_jump():
+    """自检:对每个会话模拟 _jump 跳转链(resolve_hwnd(hwnd,name) 失败 → find_window_by_pid(termpid 父链)),
+    打印每步与能否定位窗口。诊断「点击项目跳不到对应窗口」。只读 session 文件,不归档/不写。"""
+    ensure_dir()
+    try:
+        files = sorted(f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json"))
+    except OSError:
+        files = []
+    if not files:
+        print("(无会话)")
+        return 0
+    print("跳转自检 — 模拟 _jump: resolve_hwnd(hwnd,name) 失败 → find_window_by_pid(termpid 父链)")
+    n_ok = 0
+    for fn in files:
+        sid = fn[:-5]
+        try:
+            with open(os.path.join(SESSIONS_DIR, fn), "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            print("  [ERR ] %s  读 session 文件失败" % sid[:8])
+            continue
+        name = d.get("name") or sid[:8]
+        hwnd = d.get("hwnd")
+        tp = d.get("termpid")
+        kind = "scan" if d.get("scanned") else "hook"
+        tgt = resolve_hwnd(hwnd, name)
+        via = "hwnd/name"
+        if not tgt and tp:
+            tgt = find_window_by_pid(tp)
+            via = "termpid父链"
+        if tgt:
+            n_ok += 1
+            print("  [ OK ] %s  %-4s name=%r hwnd=%s tp=%s -> %s (%s)"
+                  % (sid[:8], kind, name, hwnd, tp, tgt, via))
+        else:
+            print("  [FAIL] %s  %-4s name=%r hwnd=%s tp=%s -> 定位不到窗口(进程已退?终端非前台?)"
+                  % (sid[:8], kind, name, hwnd, tp))
+    print("可跳 %d / 共 %d" % (n_ok, len(files)))
+    return 0
+
+
 def cli():
     a = sys.argv[1:]
     if not a:
         return run_gui()
+    if a[0] == "--diag":
+        return diag_jump()
     if a[0] == "--state":
         c, n = aggregate(read_sessions())
         print("%s %d" % (c, n))
@@ -776,10 +822,51 @@ def find_window_by_name(name):
         return None
 
 
+def _ancestor_pids(pid, max_depth=8):
+    """pid 及其父进程链(沿 InheritedFromUniqueProcessId 向上),用于沿链找宿主窗口:
+    termpid 是 powershell(无窗口),真正的终端/编辑器窗口在祖父 WindowsTerminal/Trae 等。
+    纯 ctypes,去重防循环。读失败/到顶返回已收集部分。"""
+    out = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+
+        class PBI(ctypes.Structure):
+            _fields_ = [("r1", ctypes.c_void_p), ("peb", ctypes.c_void_p),
+                        ("r2", ctypes.c_void_p * 2), ("pid", ctypes.c_void_p), ("r3", ctypes.c_void_p)]
+        cur = int(pid)
+        for _ in range(max_depth):
+            if not cur or cur in out:
+                break
+            out.append(cur)
+            h = k.OpenProcess(0x1000, False, cur)   # QUERY_LIMITED_INFORMATION
+            if not h:
+                break
+            try:
+                pbi = PBI()
+                if ntdll.NtQueryInformationProcess(h, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None):
+                    break
+                cur = int(pbi.r3 or 0)
+            finally:
+                k.CloseHandle(h)
+    except Exception:
+        pass
+    return out
+
+
 def find_window_by_pid(pid):
-    """按进程 PID 找一个可见顶层窗口(termpid → 终端窗口)。
-    scanned 会话没有 hwnd/项目名匹配不上时,用 claude 进程的父 PID(终端 shell)定位窗口 focus。"""
-    if not pid:
+    """按进程 PID 沿【父链】找一个可见顶层窗口。termpid 是 powershell(无窗口),真正的终端/
+    编辑器窗口在祖父(WindowsTerminal/Trae 主进程),所以收集 termpid 及其祖先 pid,一次
+    EnumWindows 命中其中任一拥有的可见顶层窗口即返回。scanned 会话 hwnd 失效/为 0 时,
+    _jump 用它兜底定位 WT/Trae 宿主窗口 focus(只查 termpid 本身永远 None —— powershell 无窗)。"""
+    pids = set(_ancestor_pids(pid))
+    if not pids:
         return None
     try:
         import ctypes
@@ -791,7 +878,6 @@ def find_window_by_pid(pid):
         u.GetWindowThreadProcessId.restype = wintypes.DWORD
         ENUMWNDPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         u.EnumWindows.argtypes = [ENUMWNDPROC, wintypes.LPARAM]; u.EnumWindows.restype = wintypes.BOOL
-        target = int(pid)
         found = [None]
 
         def _cb(hwnd, _lp):
@@ -799,7 +885,7 @@ def find_window_by_pid(pid):
                 return True
             v = wintypes.DWORD()
             u.GetWindowThreadProcessId(hwnd, ctypes.byref(v))
-            if v.value == target:
+            if v.value in pids:
                 found[0] = hwnd
                 return False                    # 找到即停
             return True
