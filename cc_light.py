@@ -92,14 +92,18 @@ def ensure_dir():
 
 
 # ---------------- 错误日志 ----------------
-def log_error(exc, context="", tb=None):
-    """记录异常到 error.log(时间+traceback+上下文,jsonl 追加写),供右键「错误日志」查看、
-    复制丢给排查。超 500KB 截断到最近 MAX_ERROR_LOG 条。写日志本身出错则静默(绝不再抛)。"""
+def log_error(exc=None, context="", tb=None):
+    """记录异常或逻辑失败事件到 error.log(时间+traceback+上下文,jsonl 追加写),供右键「错误日志」
+    查看、复制丢给排查。exc=None 时记纯事件(如「点击跳转失败」—— 触发了行为但结果不符预期,非崩溃)。
+    超 500KB 截断到最近 MAX_ERROR_LOG 条。写日志本身出错则静默(绝不再抛)。"""
     import traceback
     try:
         ensure_dir()
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        tb_text = "".join(traceback.format_exception(type(exc), exc, tb or exc.__traceback__))
+        if exc is not None:
+            tb_text = "".join(traceback.format_exception(type(exc), exc, tb or exc.__traceback__))
+        else:
+            tb_text = "(事件,无异常)"
         with open(ERROR_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": ts, "ctx": context, "tb": tb_text}, ensure_ascii=False) + "\n")
         if os.path.getsize(ERROR_LOG) > 500_000:
@@ -908,24 +912,39 @@ def work_area():
 
 
 def focus_window(hwnd):
-    """把指定 HWND 的窗口恢复+前置(点击会话名跳转到对应终端)。"""
+    """把指定 HWND 的窗口恢复+前置(点击会话名跳转)。返回是否抢到前台。
+    偶发抢不到(Windows 前台锁定:后台 topmost 进程长期运行后 SetForegroundWindow 被静默拒,
+    表现为点了不跳、重启才恢复 —— 不抛异常)。ALT 键 trick 打破锁定(系统认为用户按键才放行)
+    + AttachThreadInput 双保险。"""
     try:
         import ctypes
+        from ctypes import wintypes
         u = ctypes.windll.user32
+        u.IsIconic.argtypes = [wintypes.HWND]; u.IsIconic.restype = wintypes.BOOL
+        u.IsWindow.argtypes = [wintypes.HWND]; u.IsWindow.restype = wintypes.BOOL
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]; u.SetForegroundWindow.restype = wintypes.BOOL
+        u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
         hwnd = int(hwnd)
         if not hwnd or not u.IsWindow(hwnd):
             return False
         if u.IsIconic(hwnd):                # 最小化则恢复
             u.ShowWindow(hwnd, 9)           # SW_RESTORE
+        # ALT 键 trick:模拟用户按键,系统才放行后台进程抢前台(否则 SetForegroundWindow 被静默拒)
+        u.keybd_event(0x12, 0, 0, 0)        # VK_MENU down
+        u.keybd_event(0x12, 0, 0x02, 0)     # VK_MENU up
         cur = u.GetWindowThreadProcessId(u.GetForegroundWindow(), 0)
         tgt = u.GetWindowThreadProcessId(hwnd, 0)
-        if cur and tgt and cur != tgt:      # AttachThreadInput 绕过 SetForegroundWindow 前台限制
+        ok = False
+        if cur and tgt and cur != tgt:      # AttachThreadInput 双保险
             u.AttachThreadInput(cur, tgt, True)
-            u.SetForegroundWindow(hwnd)
+            ok = u.SetForegroundWindow(hwnd)
             u.AttachThreadInput(cur, tgt, False)
         else:
-            u.SetForegroundWindow(hwnd)
-        return True
+            ok = u.SetForegroundWindow(hwnd)
+        return bool(ok)
     except Exception:
         return False
 
@@ -1454,7 +1473,7 @@ def run_gui():
                 except Exception: pass
                 drag_card[0] = None
 
-        def _do_jump(sid):                            # 短按:跳该会话窗口
+        def _do_jump(sid):                            # 短按:跳该会话窗口(失败记日志,成功不记)
             for _s, _r, _h, _t, _sh, _nm in rows_info:
                 if _s != sid:
                     continue
@@ -1462,7 +1481,12 @@ def run_gui():
                 if not tgt and _t:
                     tgt = find_window_by_pid(_t)
                 if tgt:
-                    focus_window(tgt)
+                    if not focus_window(tgt):
+                        log_error(None, "跳转 focus 失败(前台锁定?): sid=%s name=%r hwnd=%s tgt=%s"
+                                  % (sid[:8], _nm, _h, tgt))
+                else:
+                    log_error(None, "跳转找不到窗口: sid=%s name=%r hwnd=%s termpid=%s"
+                              % (sid[:8], _nm, _h, _t))
                 if _t and _sh and _is_trae_wnd(tgt):
                     try:
                         os.startfile("trae-cn://cc-light.cc-light-helper/focus?pid=" + str(_t))
