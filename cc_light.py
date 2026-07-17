@@ -1171,6 +1171,18 @@ def run_gui():
         log_error(val, "GUI回调", tb)
     root.report_callback_exception = _on_gui_exception
 
+    # 明细窗口命名字体(单例):滚轮 configure size 时所有引用的 Label 自动跟随更新;
+    # 单例避免每次 hover 重建泄漏。_detail_base 每次 hover 重置 → 移开重进不保留缩放。
+    import tkinter.font as _tkfont
+    _detail_fonts = {
+        "name":  _tkfont.Font(family="Microsoft YaHei", size=8),
+        "word":  _tkfont.Font(family="Microsoft YaHei", size=8, weight="bold"),
+        "small": _tkfont.Font(family="Microsoft YaHei", size=7),
+        "dot":   _tkfont.Font(family="Consolas", size=10),
+        "mono":  _tkfont.Font(family="Consolas", size=7),
+    }
+    _detail_base = [8]
+
     def default_geo():
         wa = work_area()
         if wa:
@@ -1326,6 +1338,13 @@ def run_gui():
                 detail_win[0].destroy()
             except Exception:
                 pass
+        # 重置缩放:每次进来回到默认(移开重进不保留上次比例)
+        _detail_base[0] = 8
+        _detail_fonts["name"].configure(size=8)
+        _detail_fonts["word"].configure(size=8)
+        _detail_fonts["small"].configure(size=7)
+        _detail_fonts["dot"].configure(size=10)
+        _detail_fonts["mono"].configure(size=7)
         sessions = read_sessions()
         now = time.time()
         # 统计每个 hwnd 被几个会话共享(同窗口多终端 = 共享 hwnd,需要 termpid 区分)
@@ -1342,11 +1361,11 @@ def run_gui():
         order = sorted(sessions.items(),
                        key=lambda kv: (PRIO.get(effective_state(kv[1], now), 99), -kv[1].get("ts", 0)))
         names = [d.get("name", "") for _, d in sessions.items()]
-        tk.Label(win, text=" 会话明细(悬停查看,移开关闭)", fg="#9a9a9a", bg=BG,
-                 font=("Microsoft YaHei", 8)).grid(row=0, column=0, sticky="w", padx=6, pady=(4, 2))
+        tk.Label(win, text=" 会话明细(悬停查看 · 滚轮缩放,移开重进复原)", fg="#9a9a9a", bg=BG,
+                 font=_detail_fonts["name"]).grid(row=0, column=0, sticky="w", padx=6, pady=(4, 2))
         if not order:
             tk.Label(win, text=" (无活跃会话)", fg="#888888", bg=BG,
-                     font=("Microsoft YaHei", 8)).grid(row=1, column=0, sticky="w", padx=6, pady=2)
+                     font=_detail_fonts["name"]).grid(row=1, column=0, sticky="w", padx=6, pady=2)
         for i, (sid, d) in enumerate(order, start=1):
             raw = d.get("state", "gray")
             st = effective_state(d, now)
@@ -1359,22 +1378,20 @@ def run_gui():
             shared = hwnd_count.get(hwnd, 0) > 1
             row = tk.Frame(win, bg=BG)
             row.grid(row=i, column=0, sticky="w", padx=6, pady=1)
-            tk.Label(row, text="●", fg=color, bg=BG, font=("Consolas", 10)).pack(side="left")
+            tk.Label(row, text="●", fg=color, bg=BG, font=_detail_fonts["dot"]).pack(side="left")
             word = STATE_WORD.get(st, "") + (" ·超时" if stale else "")
-            tk.Label(row, text=" " + word, fg=color, bg=BG,
-                     font=("Microsoft YaHei", 8, "bold")).pack(side="left")
-            tk.Label(row, text="  " + name, fg="#dddddd", bg=BG,
-                     font=("Microsoft YaHei", 8)).pack(side="left")
+            tk.Label(row, text=" " + word, fg=color, bg=BG, font=_detail_fonts["word"]).pack(side="left")
+            tk.Label(row, text="  " + name, fg="#dddddd", bg=BG, font=_detail_fonts["name"]).pack(side="left")
             _title = get_session_title(sid, d.get("jsonl"))   # 任务标签(最近一次对话的任务),所有会话都显示
             _label = _title or ("#" + sid[:4] if multi else "")  # 无标题:多会话用 sid 区分,单会话省略
             if _label:
                 tk.Label(row, text="  " + _label, fg="#8590a0", bg=BG,
-                         font=("Microsoft YaHei", 7)).pack(side="left")
+                         font=_detail_fonts["small"]).pack(side="left")
             if shared and termpid:                       # 同窗口多终端 → 带 #pid,和诊断命令输出对得上
                 tk.Label(row, text="  #" + str(termpid), fg="#9ab8e8", bg=BG,
-                         font=("Consolas", 7)).pack(side="left")
+                         font=_detail_fonts["mono"]).pack(side="left")
             tk.Label(row, text="  " + human_ago(d.get("ts", 0)), fg="#777777", bg=BG,
-                     font=("Consolas", 7)).pack(side="left")
+                     font=_detail_fonts["mono"]).pack(side="left")
             if hwnd or termpid:
                 def _jump(e, h=hwnd, tp=termpid, shared=shared, nm=(d.get("name") or sid[:8])):
                     tgt = resolve_hwnd(h, nm)            # 记录的 hwnd 死了 → 按项目名兜底匹配当前窗口
@@ -1409,20 +1426,38 @@ def run_gui():
             row.bind("<Button-3>", _on_right)
             for _w in row.winfo_children():
                 _w.bind("<Button-3>", _on_right)
-        win.update_idletasks()
-        ww = win.winfo_reqwidth()
-        wh = win.winfo_reqheight()
-        sw = root.winfo_screenwidth()
-        sh = root.winfo_screenheight()
-        x = root.winfo_rootx() + W + 4
-        if x + ww > sw:
-            x = root.winfo_rootx() - ww - 4
-        y = root.winfo_rooty()
-        if y + wh > sh - 4:            # 超屏底 → 向上展开(底部对齐灯底)
-            y = root.winfo_rooty() + H - wh
-        if y < 0:
-            y = 0
-        win.geometry("+%d+%d" % (x, y))
+
+        def _place():
+            win.update_idletasks()
+            ww = win.winfo_reqwidth(); wh = win.winfo_reqheight()
+            sw = root.winfo_screenwidth(); sh = root.winfo_screenheight()
+            x = root.winfo_rootx() + W + 4
+            if x + ww > sw:
+                x = root.winfo_rootx() - ww - 4
+            y = root.winfo_rooty()
+            if y + wh > sh - 4:            # 超屏底 → 向上展开(底部对齐灯底)
+                y = root.winfo_rooty() + H - wh
+            x = max(0, min(x, sw - ww))    # 缩放后可能很宽/高 → 左右上下贴边,不出屏
+            y = max(0, min(y, sh - wh))
+            win.geometry("+%d+%d" % (x, y))
+
+        def _on_wheel(e):                  # 滚轮缩放:调命名字体 size(所有 Label 自动跟)+ 重新定位(不超屏)
+            _detail_base[0] = max(5, min(22, _detail_base[0] + (1 if e.delta > 0 else -1)))
+            b = _detail_base[0]
+            _detail_fonts["name"].configure(size=b)
+            _detail_fonts["word"].configure(size=b)
+            _detail_fonts["small"].configure(size=b - 1)
+            _detail_fonts["dot"].configure(size=b + 2)
+            _detail_fonts["mono"].configure(size=b - 1)
+            _place()
+
+        def _bind_wheel(w):                # 递归绑滚轮到明细内所有 widget(鼠标在任意子元素上滚都能缩放)
+            w.bind("<MouseWheel>", _on_wheel)
+            for _c in w.winfo_children():
+                _bind_wheel(_c)
+        _bind_wheel(win)
+
+        _place()
         win.bind("<Enter>", lambda e: cancel_close())
         win.bind("<Leave>", lambda e: schedule_close())
 
