@@ -1365,9 +1365,10 @@ def run_gui():
                      font=("Microsoft YaHei", 8, "bold")).pack(side="left")
             tk.Label(row, text="  " + name, fg="#dddddd", bg=BG,
                      font=("Microsoft YaHei", 8)).pack(side="left")
-            if multi:                                    # 同项目多会话 → 任务标题(aiTitle)区分"在干啥"
-                _title = get_session_title(sid, d.get("jsonl"))
-                tk.Label(row, text="  " + (_title or ("#" + sid[:4])), fg="#8590a0", bg=BG,
+            _title = get_session_title(sid, d.get("jsonl"))   # 任务标签(最近一次对话的任务),所有会话都显示
+            _label = _title or ("#" + sid[:4] if multi else "")  # 无标题:多会话用 sid 区分,单会话省略
+            if _label:
+                tk.Label(row, text="  " + _label, fg="#8590a0", bg=BG,
                          font=("Microsoft YaHei", 7)).pack(side="left")
             if shared and termpid:                       # 同窗口多终端 → 带 #pid,和诊断命令输出对得上
                 tk.Label(row, text="  #" + str(termpid), fg="#9ab8e8", bg=BG,
