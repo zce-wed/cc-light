@@ -1419,6 +1419,17 @@ def run_gui():
         rows_info = []   # [(sid, row, hwnd, termpid, shared, name), ...] 拖拽交换 / 单击跳转用
         drag = {"sid": None, "start_y": 0, "moved": False}
 
+        def _drag_style(on, drag_sid=None):           # 拖拽视觉反馈:被拖行高亮(深色),所有行换移动光标(fleur)
+            for _s, _r, *_ in rows_info:
+                bg = "#3a3a3a" if (on and _s == drag_sid) else BG
+                cur = "fleur" if on else "hand2"
+                try:
+                    _r.configure(bg=bg, cursor=cur)
+                    for _c in _r.winfo_children():
+                        _c.configure(bg=bg, cursor=cur)
+                except Exception:
+                    pass
+
         def _do_jump(sid):                            # 短按:跳该会话窗口
             for _s, _r, _h, _t, _sh, _nm in rows_info:
                 if _s != sid:
@@ -1464,9 +1475,11 @@ def run_gui():
             win.bind_all("<B1-Motion>", _on_motion)
             win.bind_all("<ButtonRelease-1>", _on_release)
 
-        def _on_motion(e):                            # 拖动 >5px 视为排序:和鼠标所在行交换
+        def _on_motion(e):                            # 拖动 >5px 视为排序:高亮被拖行 + 移动光标,和鼠标所在行交换
             if abs(e.y_root - drag["start_y"]) > 5:
-                drag["moved"] = True
+                if not drag["moved"]:
+                    drag["moved"] = True
+                    _drag_style(True, drag["sid"])
                 tgt = _row_sid_at(e.y_root)
                 if tgt and tgt != drag["sid"]:
                     _swap(drag["sid"], tgt)
@@ -1475,6 +1488,7 @@ def run_gui():
             win.unbind_all("<B1-Motion>")
             win.unbind_all("<ButtonRelease-1>")
             if drag["moved"]:
+                _drag_style(False)                    # 恢复行样式
                 write_order([t[0] for t in rows_info])
             elif drag["sid"] is not None:
                 _do_jump(drag["sid"])
