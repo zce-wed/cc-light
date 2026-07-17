@@ -145,6 +145,85 @@ def clear_error_log():
         pass
 
 
+# ---------------- 会话任务标题(同项目多会话时区分"在干啥") ----------------
+_SID_JSONL_CACHE = {}   # sid -> jsonl 路径(找一次复用)
+_TITLE_CACHE = {}       # jsonl 路径 -> (mtime, title);mtime 变才重读(hover 频繁,免反复读大 jsonl)
+
+
+def _find_jsonl(sid):
+    """按 sid 在 ~/.claude/projects/*/ 下找 <sid>.jsonl(sid 全局唯一,只在一个项目目录)。"""
+    p = _SID_JSONL_CACHE.get(sid)
+    if p and os.path.exists(p):
+        return p
+    base = os.path.join(os.environ.get("USERPROFILE") or DIR, ".claude", "projects")
+    try:
+        for proj in os.listdir(base):
+            cand = os.path.join(base, proj, sid + ".jsonl")
+            if os.path.exists(cand):
+                _SID_JSONL_CACHE[sid] = cand
+                return cand
+    except OSError:
+        pass
+    return None
+
+
+def _read_session_title(path):
+    """读 jsonl:取最后一条 aiTitle;没有则首条 user message 前 40 字;都没有返回 ""。"""
+    last_ai = ""
+    first_user = ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                t = e.get("type")
+                if t == "ai-title":
+                    v = e.get("aiTitle", "")
+                    if v:
+                        last_ai = v
+                elif t == "user" and not first_user:
+                    msg = e.get("message", {})
+                    c = msg.get("content")
+                    if isinstance(c, str):
+                        txt = c
+                    elif isinstance(c, list):
+                        txt = next((p.get("text", "") for p in c
+                                    if isinstance(p, dict) and p.get("type") == "text"), "")
+                    else:
+                        txt = ""
+                    txt = txt.strip()
+                    if txt:
+                        first_user = txt
+    except OSError:
+        pass
+    if last_ai:
+        return last_ai[:40]
+    if first_user:
+        return first_user.replace("\n", " ").strip()[:40]
+    return ""
+
+
+def get_session_title(sid, jsonl=None):
+    """会话的任务标题(同项目多会话时显示,区分"在干啥")。
+    jsonl 给定则用,否则按 sid 扫 projects 找;取最新 aiTitle,无则首条 user。
+    按 jsonl mtime 缓存(hover 频繁,避免每次全读大 jsonl)。"""
+    path = jsonl or _find_jsonl(sid)
+    if not path:
+        return ""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return ""
+    cached = _TITLE_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    title = _read_session_title(path)
+    _TITLE_CACHE[path] = (mtime, title)
+    return title
+
+
 # ---------------- per-session 读写 ----------------
 def write_session(sid, state, msg="", name=""):
     ensure_dir()
@@ -1268,8 +1347,7 @@ def run_gui():
             stale = (raw == "yellow" and st == "green")
             color = COLORS.get(st, {}).get("on", "#666666")
             name = d.get("name") or sid[:8]
-            if names.count(d.get("name", "")) > 1:
-                name = name + " " + sid[:4]
+            multi = names.count(d.get("name", "")) > 1
             hwnd = d.get("hwnd")
             termpid = d.get("termpid")
             shared = hwnd_count.get(hwnd, 0) > 1
@@ -1281,6 +1359,10 @@ def run_gui():
                      font=("Microsoft YaHei", 8, "bold")).pack(side="left")
             tk.Label(row, text="  " + name, fg="#dddddd", bg=BG,
                      font=("Microsoft YaHei", 8)).pack(side="left")
+            if multi:                                    # 同项目多会话 → 任务标题(aiTitle)区分"在干啥"
+                _title = get_session_title(sid, d.get("jsonl"))
+                tk.Label(row, text="  " + (_title or ("#" + sid[:4])), fg="#8590a0", bg=BG,
+                         font=("Microsoft YaHei", 7)).pack(side="left")
             if shared and termpid:                       # 同窗口多终端 → 带 #pid,和诊断命令输出对得上
                 tk.Label(row, text="  #" + str(termpid), fg="#9ab8e8", bg=BG,
                          font=("Consolas", 7)).pack(side="left")

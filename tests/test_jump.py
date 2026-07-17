@@ -38,6 +38,12 @@ def test_encode_path_basics():
     assert L._encode_path(r"C:\Users\pm\zcvip-front") == "C--Users-pm-zcvip-front"
 
 
+def test_get_session_title_invalid():
+    # 不存在的 sid / jsonl → 空串,不抛
+    assert L.get_session_title("nonexistent-sid-zzz") == ""
+    assert L._read_session_title("C:/no/such/file.jsonl") == ""
+
+
 if __name__ == "__main__":
     for k, fn in sorted(globals().items()):
         if k.startswith("test_"):
