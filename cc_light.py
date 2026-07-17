@@ -35,6 +35,7 @@ SCANNED_ACTIVE = 60     # scanned 会话(无 hook 心跳)按 jsonl mtime 判忙/
 DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
 ERROR_LOG = os.path.join(DATA_DIR, "error.log")          # 异常日志(右键「错误日志」查看,复制丢给排查)
 MAX_ERROR_LOG = 200   # 异常日志保留最近 N 条(超 500KB 自动截断)
+ORDER_FILE = os.path.join(DATA_DIR, "order.json")   # 用户拖拽排序的会话顺序 [sid,...]
 
 # ---- 自愈:坚果云覆盖 settings.json 冲掉 hook 时,灯窗口定期重注入 ----
 MARKER = "cc-light/"   # hook 命令路径里都含这个,用于识别/清理 cc-light entry
@@ -207,7 +208,7 @@ def _read_session_title(path):
         pass
     title = last_user or last_ai or first_user
     if title:
-        return title.replace("\n", " ").strip()[:40]
+        return title.replace("\n", " ").strip()[:200]
     return ""
 
 
@@ -228,6 +229,26 @@ def get_session_title(sid, jsonl=None):
     title = _read_session_title(path)
     _TITLE_CACHE[path] = (mtime, title)
     return title
+
+
+def read_order():
+    """读用户拖拽排序的会话顺序 [sid,...]。"""
+    try:
+        with open(ORDER_FILE, "r", encoding="utf-8") as f:
+            o = json.load(f)
+        return [s for s in o if isinstance(s, str)]
+    except Exception:
+        return []
+
+
+def write_order(sids):
+    """保存用户拖拽排序后的会话顺序(只含当前活会话,死 sid 自然淘汰)。"""
+    try:
+        ensure_dir()
+        with open(ORDER_FILE, "w", encoding="utf-8") as f:
+            json.dump(sids, f)
+    except OSError:
+        pass
 
 
 # ---------------- per-session 读写 ----------------
@@ -1183,6 +1204,32 @@ def run_gui():
     }
     _detail_base = [8]   # 当前缩放基数(单例保留:移开重进沿用上次比例)
 
+    def _add_tooltip(widget, text):
+        """widget 悬停弹出 tooltip 显示完整 text(任务标签超 20 字时悬浮看全)。"""
+        tip = [None]
+        def _show(_e):
+            if not text:
+                return
+            try:
+                t = tk.Toplevel(widget)
+                t.overrideredirect(True)
+                t.attributes("-topmost", True)
+                tk.Label(t, text=text, bg="#2a2a2a", fg="#e8e8e8",
+                         font=("Microsoft YaHei", 8), padx=6, pady=3).pack()
+                t.update_idletasks()
+                t.geometry("+%d+%d" % (widget.winfo_rootx() + 10,
+                                       widget.winfo_rooty() + widget.winfo_height() + 4))
+                tip[0] = t
+            except Exception:
+                pass
+        def _hide(_e):
+            if tip[0]:
+                try: tip[0].destroy()
+                except Exception: pass
+                tip[0] = None
+        widget.bind("<Enter>", _show, add="+")
+        widget.bind("<Leave>", _hide, add="+")
+
     def default_geo():
         wa = work_area()
         if wa:
@@ -1351,14 +1398,87 @@ def run_gui():
         win.attributes("-topmost", True)
         win.configure(bg=BG)
         detail_win[0] = win
-        order = sorted(sessions.items(),
-                       key=lambda kv: (PRIO.get(effective_state(kv[1], now), 99), -kv[1].get("ts", 0)))
+        # 显示顺序:用户拖拽顺序(order.json)优先,其余按优先级+ts 追加
+        auto = sorted(sessions.items(),
+                      key=lambda kv: (PRIO.get(effective_state(kv[1], now), 99), -kv[1].get("ts", 0)))
+        manual = read_order()
+        if manual:
+            smap = dict(auto)
+            order = [(s, smap[s]) for s in manual if s in smap]
+            seen = {s for s, _ in order}
+            order += [(s, d) for s, d in auto if s not in seen]
+        else:
+            order = auto
         names = [d.get("name", "") for _, d in sessions.items()]
-        tk.Label(win, text=" 会话明细(悬停查看 · 滚轮缩放)", fg="#9a9a9a", bg=BG,
+        tk.Label(win, text=" 会话明细(悬停查看 · 滚轮缩放 · 长按拖拽排序)", fg="#9a9a9a", bg=BG,
                  font=_detail_fonts["name"]).grid(row=0, column=0, sticky="w", padx=6, pady=(4, 2))
         if not order:
             tk.Label(win, text=" (无活跃会话)", fg="#888888", bg=BG,
                      font=_detail_fonts["name"]).grid(row=1, column=0, sticky="w", padx=6, pady=2)
+
+        rows_info = []   # [(sid, row, hwnd, termpid, shared, name), ...] 拖拽交换 / 单击跳转用
+        drag = {"sid": None, "start_y": 0, "moved": False}
+
+        def _do_jump(sid):                            # 短按:跳该会话窗口
+            for _s, _r, _h, _t, _sh, _nm in rows_info:
+                if _s != sid:
+                    continue
+                tgt = resolve_hwnd(_h, _nm)
+                if not tgt and _t:
+                    tgt = find_window_by_pid(_t)
+                if tgt:
+                    focus_window(tgt)
+                if _t and _sh and _is_trae_wnd(tgt):
+                    try:
+                        os.startfile("trae-cn://cc-light.cc-light-helper/focus?pid=" + str(_t))
+                    except Exception:
+                        pass
+                break
+            close_details()
+
+        def _row_sid_at(y_root):                      # 鼠标 y 落在哪一行
+            for _s, _r, *_ in rows_info:
+                try:
+                    if not _r.winfo_ismapped():
+                        continue
+                    ry = _r.winfo_rooty(); rh = _r.winfo_height()
+                except Exception:
+                    continue
+                if ry <= y_root <= ry + rh:
+                    return _s
+            return None
+
+        def _swap(sida, sidb):                        # 交换两行在 rows_info 的顺序 + regrid(丝滑换位)
+            if sida == sidb:
+                return
+            ia = next((i for i, t in enumerate(rows_info) if t[0] == sida), -1)
+            ib = next((i for i, t in enumerate(rows_info) if t[0] == sidb), -1)
+            if ia < 0 or ib < 0:
+                return
+            rows_info[ia], rows_info[ib] = rows_info[ib], rows_info[ia]
+            for i, t in enumerate(rows_info, start=1):
+                t[1].grid(row=i, column=0, sticky="w", padx=6, pady=1)
+
+        def _on_press(e, sid):                        # 左键按下:记录,临时全局绑 motion/release
+            drag.update(sid=sid, start_y=e.y_root, moved=False)
+            win.bind_all("<B1-Motion>", _on_motion)
+            win.bind_all("<ButtonRelease-1>", _on_release)
+
+        def _on_motion(e):                            # 拖动 >5px 视为排序:和鼠标所在行交换
+            if abs(e.y_root - drag["start_y"]) > 5:
+                drag["moved"] = True
+                tgt = _row_sid_at(e.y_root)
+                if tgt and tgt != drag["sid"]:
+                    _swap(drag["sid"], tgt)
+
+        def _on_release(_e):                          # 释放:拖了→存顺序;没拖→单击跳转
+            win.unbind_all("<B1-Motion>")
+            win.unbind_all("<ButtonRelease-1>")
+            if drag["moved"]:
+                write_order([t[0] for t in rows_info])
+            elif drag["sid"] is not None:
+                _do_jump(drag["sid"])
+
         for i, (sid, d) in enumerate(order, start=1):
             raw = d.get("state", "gray")
             st = effective_state(d, now)
@@ -1371,46 +1491,33 @@ def run_gui():
             shared = hwnd_count.get(hwnd, 0) > 1
             row = tk.Frame(win, bg=BG)
             row.grid(row=i, column=0, sticky="w", padx=6, pady=1)
+            rows_info.append((sid, row, hwnd, termpid, shared, name))
             tk.Label(row, text="●", fg=color, bg=BG, font=_detail_fonts["dot"]).pack(side="left")
             word = STATE_WORD.get(st, "") + (" ·超时" if stale else "")
             tk.Label(row, text=" " + word, fg=color, bg=BG, font=_detail_fonts["word"]).pack(side="left")
             tk.Label(row, text="  " + name, fg="#dddddd", bg=BG, font=_detail_fonts["name"]).pack(side="left")
-            _title = get_session_title(sid, d.get("jsonl"))   # 任务标签(最近一次对话的任务),所有会话都显示
+            _title = get_session_title(sid, d.get("jsonl"))   # 任务标签(最近一次对话的任务)
             _label = _title or ("#" + sid[:4] if multi else "")  # 无标题:多会话用 sid 区分,单会话省略
             if _label:
-                tk.Label(row, text="  " + _label, fg="#8590a0", bg=BG,
-                         font=_detail_fonts["small"]).pack(side="left")
-            if shared and termpid:                       # 同窗口多终端 → 带 #pid,和诊断命令输出对得上
-                tk.Label(row, text="  #" + str(termpid), fg="#9ab8e8", bg=BG,
-                         font=_detail_fonts["mono"]).pack(side="left")
+                _disp = (_title[:20] + "…") if (len(_title) > 20) else _label   # 超 20 字截断,悬浮看全
+                _tlbl = tk.Label(row, text="  " + _disp, fg="#8590a0", bg=BG, font=_detail_fonts["small"])
+                _tlbl.pack(side="left")
+                if _title and len(_title) > 20:
+                    _add_tooltip(_tlbl, _title)
+            if shared and termpid:                       # 同窗口多终端 → 带 #pid
+                tk.Label(row, text="  #" + str(termpid), fg="#9ab8e8", bg=BG, font=_detail_fonts["mono"]).pack(side="left")
             tk.Label(row, text="  " + human_ago(d.get("ts", 0)), fg="#777777", bg=BG,
                      font=_detail_fonts["mono"]).pack(side="left")
-            if hwnd or termpid:
-                def _jump(e, h=hwnd, tp=termpid, shared=shared, nm=(d.get("name") or sid[:8])):
-                    tgt = resolve_hwnd(h, nm)            # 记录的 hwnd 死了 → 按项目名兜底匹配当前窗口
-                    if not tgt and tp:                   # hwnd/项目名都没匹配(scanned 会话)→ 按终端 PID 找窗口
-                        tgt = find_window_by_pid(tp)
-                    if tgt:
-                        focus_window(tgt)               # 聚焦宿主/终端窗口
-                    if tp and shared and _is_trae_wnd(tgt):   # 仅 Trae 多终端发 URI 精确切;WT 多 tab 共享 hwnd 但无 URI,发了反激活 Trae 抢前台
-                        try:
-                            os.startfile("trae-cn://cc-light.cc-light-helper/focus?pid=" + str(tp))
-                        except Exception:
-                            pass
-                    close_details()
-                row.bind("<Button-1>", _jump)
-                row.configure(cursor="hand2")
-                for _w in row.winfo_children():
-                    _w.bind("<Button-1>", _jump)
-                    _w.configure(cursor="hand2")
-            # 右键会话行:删除该会话(清理残留/不想要的条目;若会话仍活跃,下次 hook 会重建)
+            # 左键:短按跳转 / 长按拖拽排序(>5px 视为拖拽);右键删除
+            row.bind("<ButtonPress-1>", lambda e, sid=sid: _on_press(e, sid))
+            row.configure(cursor="hand2")
             def _on_right(e, s=sid):
                 m = tk.Menu(root, tearoff=0, bg=BG, fg="#dddddd",
                             activebackground="#3a3a3a", activeforeground="#ffffff")
                 def _do():
-                    archive_session(s)               # 归档(可还原),非真删
+                    archive_session(s)
                     close_details()
-                    root.after(20, details_hover)    # 关闭后重开 → 刷新列表
+                    root.after(20, details_hover)
                 m.add_command(label="删除该会话", command=_do)
                 try:
                     m.tk_popup(e.x_root, e.y_root)
@@ -1418,6 +1525,8 @@ def run_gui():
                     m.grab_release()
             row.bind("<Button-3>", _on_right)
             for _w in row.winfo_children():
+                _w.bind("<ButtonPress-1>", lambda e, sid=sid: _on_press(e, sid))
+                _w.configure(cursor="hand2")
                 _w.bind("<Button-3>", _on_right)
 
         def _place():
