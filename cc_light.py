@@ -1418,6 +1418,7 @@ def run_gui():
 
         rows_info = []   # [(sid, row, hwnd, termpid, shared, name), ...] 拖拽交换 / 单击跳转用
         drag = {"sid": None, "start_y": 0, "moved": False}
+        drag_card = [None]   # 跟随鼠标的浮动卡片(↕ 项目名),拖拽时显示
 
         def _drag_style(on, drag_sid=None):           # 拖拽视觉反馈:被拖行高亮(深色),所有行换移动光标(fleur)
             for _s, _r, *_ in rows_info:
@@ -1429,6 +1430,29 @@ def run_gui():
                         _c.configure(bg=bg, cursor=cur)
                 except Exception:
                     pass
+
+        def _drag_card_show(sid):                     # 显示浮动卡片(↕ + 被拖会话名)
+            nm = next((t[5] for t in rows_info if t[0] == sid), sid[:8])
+            c = tk.Toplevel(win)
+            c.overrideredirect(True)
+            c.attributes("-topmost", True)
+            c.configure(bg="#2a2a2a")
+            tk.Label(c, text="↕ " + nm, fg="#e8e8e8", bg="#2a2a2a",
+                     font=("Microsoft YaHei", 8, "bold"), padx=8, pady=4).pack()
+            drag_card[0] = c
+
+        def _drag_card_move(x, y):                    # 卡片跟随鼠标(右下偏移,不遮挡光标)
+            if drag_card[0]:
+                try:
+                    drag_card[0].geometry("+%d+%d" % (x + 14, y + 10))
+                except Exception:
+                    pass
+
+        def _drag_card_hide():
+            if drag_card[0]:
+                try: drag_card[0].destroy()
+                except Exception: pass
+                drag_card[0] = None
 
         def _do_jump(sid):                            # 短按:跳该会话窗口
             for _s, _r, _h, _t, _sh, _nm in rows_info:
@@ -1475,11 +1499,13 @@ def run_gui():
             win.bind_all("<B1-Motion>", _on_motion)
             win.bind_all("<ButtonRelease-1>", _on_release)
 
-        def _on_motion(e):                            # 拖动 >5px 视为排序:高亮被拖行 + 移动光标,和鼠标所在行交换
+        def _on_motion(e):                            # 拖动 >5px 视为排序:高亮+浮动卡片,和鼠标所在行交换
             if abs(e.y_root - drag["start_y"]) > 5:
                 if not drag["moved"]:
                     drag["moved"] = True
                     _drag_style(True, drag["sid"])
+                    _drag_card_show(drag["sid"])
+                _drag_card_move(e.x_root, e.y_root)
                 tgt = _row_sid_at(e.y_root)
                 if tgt and tgt != drag["sid"]:
                     _swap(drag["sid"], tgt)
@@ -1487,6 +1513,7 @@ def run_gui():
         def _on_release(_e):                          # 释放:拖了→存顺序;没拖→单击跳转
             win.unbind_all("<B1-Motion>")
             win.unbind_all("<ButtonRelease-1>")
+            _drag_card_hide()
             if drag["moved"]:
                 _drag_style(False)                    # 恢复行样式
                 write_order([t[0] for t in rows_info])
