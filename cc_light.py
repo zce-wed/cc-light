@@ -1181,7 +1181,7 @@ def run_gui():
         "dot":   _tkfont.Font(family="Consolas", size=10),
         "mono":  _tkfont.Font(family="Consolas", size=7),
     }
-    _detail_base = [8]
+    _detail_base = [8]   # 当前缩放基数(单例保留:移开重进沿用上次比例)
 
     def default_geo():
         wa = work_area()
@@ -1338,13 +1338,6 @@ def run_gui():
                 detail_win[0].destroy()
             except Exception:
                 pass
-        # 重置缩放:每次进来回到默认(移开重进不保留上次比例)
-        _detail_base[0] = 8
-        _detail_fonts["name"].configure(size=8)
-        _detail_fonts["word"].configure(size=8)
-        _detail_fonts["small"].configure(size=7)
-        _detail_fonts["dot"].configure(size=10)
-        _detail_fonts["mono"].configure(size=7)
         sessions = read_sessions()
         now = time.time()
         # 统计每个 hwnd 被几个会话共享(同窗口多终端 = 共享 hwnd,需要 termpid 区分)
@@ -1361,7 +1354,7 @@ def run_gui():
         order = sorted(sessions.items(),
                        key=lambda kv: (PRIO.get(effective_state(kv[1], now), 99), -kv[1].get("ts", 0)))
         names = [d.get("name", "") for _, d in sessions.items()]
-        tk.Label(win, text=" 会话明细(悬停查看 · 滚轮缩放,移开重进复原)", fg="#9a9a9a", bg=BG,
+        tk.Label(win, text=" 会话明细(悬停查看 · 滚轮缩放)", fg="#9a9a9a", bg=BG,
                  font=_detail_fonts["name"]).grid(row=0, column=0, sticky="w", padx=6, pady=(4, 2))
         if not order:
             tk.Label(win, text=" (无活跃会话)", fg="#888888", bg=BG,
