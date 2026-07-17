@@ -937,18 +937,25 @@ def focus_window(hwnd):
         # ALT 键 trick:模拟用户按键,系统才放行后台进程抢前台(否则 SetForegroundWindow 被静默拒)
         u.keybd_event(0x12, 0, 0, 0)        # VK_MENU down
         u.keybd_event(0x12, 0, 0x02, 0)     # VK_MENU up
-        cur = u.GetWindowThreadProcessId(u.GetForegroundWindow(), 0)
-        tgt = u.GetWindowThreadProcessId(hwnd, 0)
+        # 调用线程 attach 到前台线程 → 借前台权限(经典绕过前台锁定):AttachThreadInput(调用,前台)
+        k = ctypes.windll.kernel32
+        cur = k.GetCurrentThreadId()
+        fg = u.GetWindowThreadProcessId(u.GetForegroundWindow(), None)
         attached = False
-        if cur and tgt and cur != tgt:      # AttachThreadInput 双保险
-            u.AttachThreadInput(cur, tgt, True)
+        if fg and cur != fg:
+            u.AttachThreadInput(cur, fg, True)
             attached = True
         u.ShowWindow(hwnd, 5)               # SW_SHOW 确保可见
         u.BringWindowToTop(hwnd)
         u.SetForegroundWindow(hwnd)
         if attached:
-            u.AttachThreadInput(cur, tgt, False)
-        return u.GetForegroundWindow() == hwnd    # 真实验证(SetForegroundWindow 返回值会误报)
+            u.AttachThreadInput(cur, fg, False)
+        # SetForegroundWindow 跨进程可能异步:立即查会误报失败,短暂重试验证
+        for _ in range(6):
+            if u.GetForegroundWindow() == hwnd:
+                return True
+            time.sleep(0.012)
+        return False
     except Exception:
         return False
 
