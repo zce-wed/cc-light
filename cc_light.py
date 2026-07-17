@@ -912,21 +912,23 @@ def work_area():
 
 
 def focus_window(hwnd):
-    """把指定 HWND 的窗口恢复+前置(点击会话名跳转)。返回是否抢到前台。
+    """把指定 HWND 的窗口恢复+前置(点击会话名跳转)。返回是否【真正】抢到前台。
     偶发抢不到(Windows 前台锁定:后台 topmost 进程长期运行后 SetForegroundWindow 被静默拒,
-    表现为点了不跳、重启才恢复 —— 不抛异常)。ALT 键 trick 打破锁定(系统认为用户按键才放行)
-    + AttachThreadInput 双保险。"""
+    表现为点了不跳、重启才恢复)。ALT 键 trick 打破锁定 + AttachThreadInput + BringWindowToTop
+    多管齐下;用 GetForegroundWindow 验证真实结果(SetForegroundWindow 返回值不可靠、会误报失败)。"""
     try:
         import ctypes
         from ctypes import wintypes
         u = ctypes.windll.user32
         u.IsIconic.argtypes = [wintypes.HWND]; u.IsIconic.restype = wintypes.BOOL
         u.IsWindow.argtypes = [wintypes.HWND]; u.IsWindow.restype = wintypes.BOOL
-        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]; u.ShowWindow.restype = wintypes.BOOL
+        u.GetForegroundWindow.argtypes = []; u.GetForegroundWindow.restype = wintypes.HWND
         u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         u.GetWindowThreadProcessId.restype = wintypes.DWORD
         u.SetForegroundWindow.argtypes = [wintypes.HWND]; u.SetForegroundWindow.restype = wintypes.BOOL
         u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        u.BringWindowToTop.argtypes = [wintypes.HWND]; u.BringWindowToTop.restype = wintypes.BOOL
         hwnd = int(hwnd)
         if not hwnd or not u.IsWindow(hwnd):
             return False
@@ -937,14 +939,16 @@ def focus_window(hwnd):
         u.keybd_event(0x12, 0, 0x02, 0)     # VK_MENU up
         cur = u.GetWindowThreadProcessId(u.GetForegroundWindow(), 0)
         tgt = u.GetWindowThreadProcessId(hwnd, 0)
-        ok = False
+        attached = False
         if cur and tgt and cur != tgt:      # AttachThreadInput 双保险
             u.AttachThreadInput(cur, tgt, True)
-            ok = u.SetForegroundWindow(hwnd)
+            attached = True
+        u.ShowWindow(hwnd, 5)               # SW_SHOW 确保可见
+        u.BringWindowToTop(hwnd)
+        u.SetForegroundWindow(hwnd)
+        if attached:
             u.AttachThreadInput(cur, tgt, False)
-        else:
-            ok = u.SetForegroundWindow(hwnd)
-        return bool(ok)
+        return u.GetForegroundWindow() == hwnd    # 真实验证(SetForegroundWindow 返回值会误报)
     except Exception:
         return False
 
