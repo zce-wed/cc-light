@@ -168,9 +168,13 @@ def _find_jsonl(sid):
 
 
 def _read_session_title(path):
-    """读 jsonl:取最后一条 aiTitle;没有则首条 user message 前 40 字;都没有返回 ""。"""
+    """读 jsonl:取【最后一条有意义的 user message】(反映最近在干啥,不是会话整体 aiTitle ——
+    同会话从任务a切到b时,aiTitle 往往还停在a,最近 user 才是b)。user 太短(<6字,如"修"/"继续")
+    跳过往前找;都短则 fallback 最新 aiTitle,再 fallback 首条 user。"""
+    last_user = ""       # 最后一条 ≥MIN 字的用户输入
     last_ai = ""
     first_user = ""
+    MIN = 6
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -183,25 +187,27 @@ def _read_session_title(path):
                     v = e.get("aiTitle", "")
                     if v:
                         last_ai = v
-                elif t == "user" and not first_user:
+                elif t == "user":
                     msg = e.get("message", {})
                     c = msg.get("content")
                     if isinstance(c, str):
                         txt = c
                     elif isinstance(c, list):
+                        # 只取用户输入的 text part;tool_result(工具返回)也在 user entry 里,排除
                         txt = next((p.get("text", "") for p in c
                                     if isinstance(p, dict) and p.get("type") == "text"), "")
                     else:
                         txt = ""
                     txt = txt.strip()
                     if txt:
-                        first_user = txt
+                        first_user = first_user or txt
+                        if len(txt) >= MIN:
+                            last_user = txt           # 不断覆盖,留在最后一条
     except OSError:
         pass
-    if last_ai:
-        return last_ai[:40]
-    if first_user:
-        return first_user.replace("\n", " ").strip()[:40]
+    title = last_user or last_ai or first_user
+    if title:
+        return title.replace("\n", " ").strip()[:40]
     return ""
 
 
