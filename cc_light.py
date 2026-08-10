@@ -28,6 +28,7 @@ MISS_LOG = os.path.join(DATA_DIR, "hook-miss.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 NOTES_FILE = os.path.join(DATA_DIR, "notes.json")                  # 便签/历史窗口几何(位置+大小)
 NOTES_HISTORY_FILE = os.path.join(DATA_DIR, "notes_history.json")  # 快捷记录历史条目数组(末尾最新)
+SNIPPETS_FILE = os.path.join(DATA_DIR, "snippets.json")            # 快捷指令:[{id,title,text}, ...]
 MAX_HISTORY = 500   # 历史上限(超出截断最旧的)
 STALE = 1 * 3600        # 1 小时无更新 → 归档(可被「检测所有会话」还原)
 SCAN_ACTIVE = 6 * 3600  # 「检测所有会话」:jsonl 6h 内有写入视为会话仍开着(覆盖午休等长空闲)
@@ -597,6 +598,28 @@ def save_history(items):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False)
         os.replace(tmp, NOTES_HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def load_snippets():
+    """快捷指令列表:[{id,title,text}, ...]。"""
+    try:
+        with open(SNIPPETS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_snippets(items):
+    """原子写快捷指令。"""
+    try:
+        ensure_dir()
+        tmp = SNIPPETS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.replace(tmp, SNIPPETS_FILE)
     except Exception:
         pass
 
@@ -1389,6 +1412,7 @@ def run_gui():
     # ---- 会话明细 ----
     detail_win = [None]
     close_timer = [None]
+    detail_menu_active = [False]   # 右键菜单弹出期间抑制明细窗口的 Leave 自动关闭(防菜单随之消失)
 
     def cancel_close():
         if close_timer[0]:
@@ -1405,6 +1429,8 @@ def run_gui():
             detail_win[0] = None
 
     def schedule_close():
+        if detail_menu_active[0]:       # 菜单打开中(鼠标移到菜单上触发了 Leave)→ 别关,否则菜单跟着没
+            return
         cancel_close()
         close_timer[0] = root.after(300, close_details)
 
@@ -1588,9 +1614,12 @@ def run_gui():
             row.bind("<ButtonPress-1>", lambda e, sid=sid: _on_press(e, sid))
             row.configure(cursor="hand2")
             def _on_right(e, s=sid):
+                cancel_close()                      # 清掉已排的自动关闭,给菜单留出操作时间
+                detail_menu_active[0] = True        # 菜单期间抑制 Leave→destroy,否则菜单一弹出就消失
                 m = tk.Menu(root, tearoff=0, bg=BG, fg="#dddddd",
                             activebackground="#3a3a3a", activeforeground="#ffffff")
                 def _do():
+                    detail_menu_active[0] = False
                     archive_session(s)
                     close_details()
                     root.after(20, details_hover)
@@ -1599,6 +1628,7 @@ def run_gui():
                     m.tk_popup(e.x_root, e.y_root)
                 finally:
                     m.grab_release()
+                    detail_menu_active[0] = False   # 菜单关闭(选中或 Esc/点外)→ 恢复 Leave 自动关闭
             row.bind("<Button-3>", _on_right)
             for _w in row.winfo_children():
                 _w.bind("<ButtonPress-1>", lambda e, sid=sid: _on_press(e, sid))
@@ -1769,6 +1799,7 @@ def run_gui():
     note_win = [None]          # 当前便签 Toplevel(单例;已开则前置聚焦)
     note_text = [None]         # 便签内的 Text 控件
     hist_win = [None]          # 历史窗口(单例;重复打开只保留一个)
+    snippets_win = [None]      # 快捷指令窗口(单例;重复打开只保留一个)
     NOTE_MIN_W, NOTE_MIN_H = 240, 140
 
     def _close_note():
@@ -2156,6 +2187,316 @@ def run_gui():
             entry.bind("<Escape>", _on_esc)
             win.after(150, lambda: _apply_filter(""))   # 布局后初始化预览高度 + 计数
 
+    def show_snippets():
+        """快捷指令:列表(左键复制内容到剪切板,右键编辑/删除)。
+        一条都没有 → 直接显示添加表单;有记录 → 显示列表(顶部「＋ 新增」入口)。
+        单窗口双状态,单例,重复打开只前置。"""
+        nw = 380
+
+        def _lamp_pos():
+            """弹框贴交通灯右侧(超右屏则改灯左侧),垂直顶部对齐灯窗口。"""
+            nx = root.winfo_rootx() + W + 6
+            ny = max(0, root.winfo_rooty())
+            if nx + nw > root.winfo_screenwidth() - 6:
+                nx = max(0, root.winfo_rootx() - nw - 6)
+            return max(0, nx), max(0, ny)
+
+        if snippets_win[0] is not None and snippets_win[0].winfo_exists():
+            w = snippets_win[0]
+            try:
+                if w.wm_state() == "iconic":        # 最小化态 → 复原
+                    w.deiconify()
+                nx, ny = _lamp_pos()                 # 重新贴灯定位(灯可能已被拖动)
+                w.geometry("+%d+%d" % (nx, ny))
+                w.lift()
+                w.attributes("-topmost", True)
+                w.focus_force()
+            except Exception:
+                pass
+            return
+        win = tk.Toplevel(root)
+        win.title("快捷指令")
+        win.attributes("-topmost", True)
+        win.configure(bg=BG)
+        _set_note_icon(win)
+        snippets_win[0] = win
+        items = load_snippets()
+        nx, ny = _lamp_pos()
+        win.geometry("%dx%d+%d+%d" % (nw, 220, nx, ny))
+        win.update_idletasks()
+
+        # 顶部:标题(左) + ＋新增(右)。系统标题栏提供 ✕/最小化。
+        top = tk.Frame(win, bg=BG)
+        top.pack(side="top", fill="x", padx=6, pady=(6, 4))
+        title_lbl = tk.Label(top, text=" 快捷指令", fg="#9a9a9a", bg=BG,
+                             font=("Microsoft YaHei", 9))
+        title_lbl.pack(side="left")
+        add_btn = tk.Label(top, text="＋ 新增", fg="#9a9a9a", bg=BG,
+                           font=("Microsoft YaHei", 9), padx=6, cursor="hand2")
+        add_btn.pack(side="right")
+        add_btn.bind("<Enter>", lambda e: add_btn.configure(fg="#ffffff"))
+        add_btn.bind("<Leave>", lambda e: add_btn.configure(fg="#9a9a9a"))
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 6))
+
+        def _clear_body():
+            for _c in body.winfo_children():
+                try:
+                    _c.destroy()
+                except Exception:
+                    pass
+
+        def _apply_size(h):
+            """切换列表/编辑态时重设窗口高度,并校正 y 使整窗留在工作区内
+            (灯窗口常贴屏底,旁边弹出的高窗口会溢出屏幕底部)。"""
+            try:
+                wx, wy = win.winfo_x(), win.winfo_y()
+                wa = work_area()
+                bot = wa[3] if wa else win.winfo_screenheight()
+                top = wa[1] if wa else 0
+                if wy + h > bot:
+                    wy = max(top, bot - h)
+                win.geometry("%dx%d+%d+%d" % (nw, h, max(0, wx), max(0, wy)))
+            except Exception:
+                pass
+
+        def _set_title(t):
+            try:
+                title_lbl.config(text=" " + t)
+            except Exception:
+                pass
+
+        def _close():
+            snippets_win[0] = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _copy(tx, label):
+            """把内容写进系统剪切板 → body 换成醒目'已复制'提示 → 短暂停留后关窗(用完即走)。"""
+            try:
+                root.clipboard_clear()
+                root.clipboard_append(tx)
+                root.update()          # 立即让剪切板生效
+            except Exception as ex:
+                log_error(ex, "复制快捷指令")
+                _set_title("复制失败")
+                return
+            _clear_body()
+            try:
+                add_btn.pack_forget()              # 提示态:收起新增入口
+            except Exception:
+                pass
+            _apply_size(150)
+            _set_title("已复制")
+            box = tk.Frame(body, bg=BG)
+            box.pack(expand=True)
+            tk.Label(box, text="✓", fg="#34d058", bg=BG,
+                     font=("Segoe UI Symbol", 30)).pack(pady=(16, 0))
+            tk.Label(box, text="已复制到剪切板", fg="#cfcfcf", bg=BG,
+                     font=("Microsoft YaHei", 11)).pack(pady=(2, 0))
+            if label:
+                tk.Label(box, text=label, fg="#777777", bg=BG,
+                         font=("Microsoft YaHei", 9)).pack(pady=(1, 12))
+            win.after(700, _close)
+
+        # ---------- 列表态(有记录) ----------
+        def _render_list():
+            _clear_body()
+            add_btn.pack(side="right")            # 列表态:显出新增入口
+            items = load_snippets()
+            _apply_size(max(160, min(96 + len(items) * 34, 480)))
+            _set_title("快捷指令(共 %d 条)" % len(items))
+
+            cv = tk.Canvas(body, bg=BG, bd=0, highlightthickness=0)
+            sb = tk.Scrollbar(body, orient="vertical", command=cv.yview)
+            cv.configure(yscrollcommand=sb.set)
+            cv.pack(side="left", fill="both", expand=True)
+            inner = tk.Frame(cv, bg=BG)
+            inner_win = cv.create_window((0, 0), window=inner, anchor="nw")
+            rows = []
+
+            def _sync_sb(vis_h):
+                cv.configure(scrollregion=cv.bbox("all"))
+                bbox = cv.bbox("all")
+                content_h = (bbox[3] - bbox[1]) if bbox else 0
+                need = content_h > vis_h + 2
+                try:
+                    if need and not sb.winfo_ismapped():
+                        sb.pack(side="right", fill="y")
+                    elif not need and sb.winfo_ismapped():
+                        sb.pack_forget()
+                except Exception:
+                    pass
+
+            def _resize_text(t):
+                try:
+                    t.update_idletasks()
+                    r = t.count("1.0", "end-1c", "displaylines")
+                    t.config(height=max(1, r[0] if r else 1))
+                except Exception:
+                    pass
+
+            def _on_cv_cfg(e):
+                cv.itemconfig(inner_win, width=e.width)
+                for _it, _row, _ptxt in rows:
+                    if _row.winfo_ismapped():
+                        _resize_text(_ptxt)
+                _sync_sb(e.height)
+
+            inner.bind("<Configure>", lambda e: _sync_sb(cv.winfo_height()))
+            cv.bind("<Configure>", _on_cv_cfg)
+
+            def _wheel(e):
+                try:
+                    cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                except Exception:
+                    pass
+
+            def _unbind_wheel(_e=None):
+                try:
+                    cv.unbind_all("<MouseWheel>")
+                except Exception:
+                    pass
+
+            cv.bind("<Enter>", lambda e: cv.bind_all("<MouseWheel>", _wheel))
+            cv.bind("<Leave>", _unbind_wheel)
+
+            if not items:
+                tk.Label(inner, text="还没有快捷指令", fg="#cfcfcf", bg=BG,
+                         font=("Microsoft YaHei", 10)).pack(anchor="w", padx=4, pady=(8, 2))
+                tk.Label(inner, text="点右上「＋ 新增」或下面按钮添加第一条", fg="#777777", bg=BG,
+                         font=("Microsoft YaHei", 9)).pack(anchor="w", padx=4)
+                tk.Button(inner, text="＋ 新增快捷指令", command=lambda: _render_edit(None),
+                          bg="#3a3a3a", fg="#e8e8e8", activebackground="#4a4a4a", relief="flat",
+                          bd=0, font=("Microsoft YaHei", 9), padx=12, pady=4
+                          ).pack(anchor="w", padx=4, pady=(8, 4))
+            else:
+                for it in items:
+                    text = it.get("text", "")
+                    label = it.get("title") or text.splitlines()[0][:24] if text else "(空)"
+                    row = tk.Frame(inner, bg=BG)
+                    row.pack(side="top", fill="x", padx=2, pady=2)
+                    name_lbl = tk.Label(row, text=label, fg="#cfcfcf", bg=BG,
+                                        font=("Microsoft YaHei", 9, "bold"), cursor="hand2")
+                    name_lbl.pack(side="left", padx=(2, 6))
+                    ptxt = tk.Text(row, bg=BG, fg="#a0a0a0", bd=0, highlightthickness=0,
+                                   wrap="word", font=("Microsoft YaHei", 9), height=1,
+                                   padx=0, pady=0, cursor="hand2")
+                    ptxt.pack(side="left", fill="x", expand=True)
+                    ptxt.insert("1.0", preview_snippet(text, "")[0])
+                    ptxt.config(state="disabled")
+                    row.configure(cursor="hand2")
+
+                    def _click(e, tx=text, lb=label):
+                        _copy(tx, lb)
+
+                    def _right(e, _it=it):
+                        m = tk.Menu(root, tearoff=0, bg=BG, fg="#dddddd",
+                                    activebackground="#3a3a3a", activeforeground="#ffffff")
+                        m.add_command(label="编辑", command=lambda: _render_edit(_it))
+
+                        def _del():
+                            save_snippets([x for x in load_snippets()
+                                           if x.get("id") != _it.get("id")])
+                            _render_list()
+
+                        m.add_command(label="删除", command=_del)
+                        try:
+                            m.tk_popup(e.x_root, e.y_root)
+                        finally:
+                            m.grab_release()
+
+                    name_lbl.bind("<Button-1>", _click)
+                    name_lbl.bind("<Button-3>", _right)
+                    row.bind("<Button-1>", _click)
+                    ptxt.bind("<Button-1>", _click)
+                    row.bind("<Button-3>", _right)
+                    ptxt.bind("<Button-3>", _right)
+                    rows.append((it, row, ptxt))
+                win.after(120, lambda: _sync_sb(cv.winfo_height()))
+
+        # ---------- 编辑/新增态(共用一张表单) ----------
+        def _render_edit(existing):
+            _clear_body()
+            add_btn.pack_forget()                 # 编辑态:收起顶部新增入口,避免误触
+            is_new = existing is None
+            _apply_size(320)
+            _set_title("新增快捷指令" if is_new else "编辑快捷指令")
+
+            form = tk.Frame(body, bg=BG)
+            form.pack(side="top", fill="both", expand=True, padx=2, pady=2)
+            tk.Label(form, text="名称(可选,留空取内容首行)", fg="#777777", bg=BG,
+                    font=("Microsoft YaHei", 8)).pack(anchor="w")
+            title_e = tk.Entry(form, bg="#2a2a2a", fg="#e8e8e8", insertbackground="#e8e8e8",
+                               relief="flat", bd=0, font=("Microsoft YaHei", 10))
+            title_e.pack(fill="x", pady=(2, 8))
+            if not is_new:
+                title_e.insert(0, existing.get("title", ""))
+            tk.Label(form, text="内容(列表里左键点击即复制此项)", fg="#777777", bg=BG,
+                    font=("Microsoft YaHei", 8)).pack(anchor="w")
+            text_t = tk.Text(form, bg="#2a2a2a", fg="#e8e8e8", insertbackground="#e8e8e8",
+                             bd=0, highlightthickness=0, wrap="word", relief="flat",
+                             font=("Microsoft YaHei", 10), padx=6, pady=5, height=6)
+            text_t.pack(fill="both", expand=True, pady=(2, 8))
+            if not is_new:
+                text_t.insert("1.0", existing.get("text", ""))
+
+            def _flash(msg):
+                _set_title(msg)
+                win.after(1200, lambda: _set_title("新增快捷指令" if is_new else "编辑快捷指令"))
+
+            def _save():
+                title = title_e.get().strip()
+                text = text_t.get("1.0", "end-1c").strip()
+                if not text:                      # 内容必填(空内容没意义)
+                    _flash("内容不能为空")
+                    text_t.focus_set()
+                    return
+                if not title:
+                    title = text.splitlines()[0][:24]
+                items = load_snippets()
+                if is_new:
+                    items.append({"id": int(time.time() * 1000), "title": title, "text": text})
+                else:
+                    _id = existing.get("id")
+                    for x in items:
+                        if x.get("id") == _id:
+                            x["title"] = title
+                            x["text"] = text
+                            break
+                save_snippets(items)
+                _render_list()
+
+            def _cancel():
+                if is_new and not load_snippets():
+                    _close()                      # 新增态 + 本来就空 → 直接关窗
+                else:
+                    _render_list()
+
+            btns = tk.Frame(form, bg=BG)
+            btns.pack(fill="x")
+            tk.Button(btns, text="取消", command=_cancel, bg="#2a2a2a", fg="#9a9a9a",
+                      activebackground="#3a3a3a", relief="flat", bd=0,
+                      font=("Microsoft YaHei", 9), padx=12).pack(side="right", padx=(0, 6))
+            tk.Button(btns, text="保存", command=_save, bg="#3a3a3a", fg="#e8e8e8",
+                      activebackground="#4a4a4a", relief="flat", bd=0,
+                      font=("Microsoft YaHei", 9), padx=14).pack(side="right")
+            win.bind("<Control-Return>", lambda e: (_save(), "break")[1])   # Ctrl+Enter 保存
+            title_e.focus_set()
+
+        add_btn.bind("<Button-1>", lambda e: _render_edit(None))
+        win.bind("<Escape>", lambda e: _close())
+        win.bind("<Destroy>", lambda e: snippets_win.__setitem__(0, None), add="+")
+
+        # 首次打开:空 → 直接添加表单;非空 → 列表
+        if items:
+            _render_list()
+        else:
+            _render_edit(None)
+
     def show_error_log():
         """弹出错误日志窗口:最近异常(最新在上),可一键复制全文丢给排查。"""
         w = tk.Toplevel(root)
@@ -2216,6 +2557,7 @@ def run_gui():
     menu.add_command(label="错误日志", command=show_error_log)   # 显示异常日志,可复制丢给排查
     menu.add_separator()
     menu.add_command(label="快捷记录", command=toggle_note)
+    menu.add_command(label="快捷指令", command=show_snippets)
     menu.add_separator()
     menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
     menu.add_cascade(label="超时时间", menu=timeout_menu)
@@ -2227,9 +2569,65 @@ def run_gui():
             pass
         root.destroy()
 
+    def restore_statusline():
+        """把 claude-hud 的 statusLine 写回 ~/.claude/settings.json —— 一键恢复上下文栏。
+        根因:CC Switch 切模型重写 settings.json 时常把 statusLine 字段丢掉,Claude Code
+        无 statusLine 可调 → 整条上下文栏消失(切回带 statusLine 的配置才显示)。本函数
+        优先从 ~/.claude 下最近一份含 claude-hud 的备份取 statusLine,都没有则用内置标准值;
+        保留 settings.json 其他字段不动(原子写)。"""
+        import glob
+        import tkinter.messagebox as mb
+        home = os.path.expanduser("~")
+        sf = os.path.join(home, ".claude", "settings.json")
+        STD_CMD = (
+            'cols=${COLUMNS:-}; case "$cols" in ""|*[!0-9]*) cols=$(stty size </dev/tty 2>/dev/null | awk \'{print $2}\');; esac; '
+            'case "$cols" in ""|*[!0-9]*) cols=120;; esac; export COLUMNS=$(( cols > 4 ? cols - 4 : 1 )); '
+            'plugin_dir=$(ls -1d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/*/claude-hud/*/ 2>/dev/null | sort -V | tail -1); '
+            'exec "C:/Program Files/nodejs/node.exe" "${plugin_dir}dist/index.js"'
+        )
+        try:
+            with open(sf, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception as e:
+            log_error(e, "restore_statusline read")
+            try: mb.showerror("恢复上下文栏", "读不到 settings.json:\n" + sf)
+            except Exception: pass
+            return
+        if "claude-hud" in (d.get("statusLine") or {}).get("command", ""):
+            try: mb.showinfo("恢复上下文栏", "statusLine 已经在(指向 claude-hud),无需恢复。\n若状态栏仍不显示,重开一下会话。")
+            except Exception: pass
+            return
+        sl, src = None, "内置标准值"
+        try:
+            for b in sorted(glob.glob(os.path.join(home, ".claude", "settings.json*")), key=os.path.getmtime, reverse=True):
+                if os.path.abspath(b) == os.path.abspath(sf): continue
+                try:
+                    with open(b, encoding="utf-8") as f: bd = json.load(f)
+                    if "claude-hud" in (bd.get("statusLine") or {}).get("command", ""):
+                        sl, src = bd["statusLine"], os.path.basename(b); break
+                except Exception: pass
+        except Exception: pass
+        if not sl:
+            sl = {"type": "command", "command": STD_CMD}
+        try:
+            d["statusLine"] = sl
+            tmp = sf + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, sf)
+        except Exception as e:
+            log_error(e, "restore_statusline write")
+            try: mb.showerror("恢复上下文栏", "写入失败:" + str(e))
+            except Exception: pass
+            return
+        try: mb.showinfo("恢复上下文栏", "已把 statusLine 写回 settings.json(取自 " + src + ")。\n上下文栏应在 ~1 秒内恢复;若没动静,重开当前会话即可。")
+        except Exception: pass
+
     menu.add_separator()
     menu.add_checkbutton(label="窗口置顶", variable=topmost_var, command=on_toggle_topmost)
     menu.add_command(label="复位位置", command=lambda: root.geometry(default_geo()))
+    menu.add_separator()
+    menu.add_command(label="恢复上下文栏", command=restore_statusline)
     menu.add_command(label="重启", command=restart)
     menu.add_command(label="退出", command=root.destroy)
     cv.bind("<ButtonPress-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
