@@ -3,6 +3,7 @@
 Windows API 依赖运行环境,这里只测纯逻辑分支(空值/死 pid 不崩 + 合理返回);
 端到端用 `python cc_light.py --diag` 验证当前所有会话能定位窗口。"""
 import sys, os
+from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import cc_light as L
 
@@ -36,6 +37,18 @@ def test_encode_path_basics():
     # session 的 name 兜底匹配窗口标题用的是 basename(cwd 末段);
     # _encode_path 仅用于匹配 ~/.claude/projects 目录名,勿与 name 混淆。
     assert L._encode_path(r"C:\Users\pm\zcvip-front") == "C--Users-pm-zcvip-front"
+
+
+def test_trae_focus_uri_uses_pid_chain():
+    with patch.object(L, "_ancestor_pids", return_value=[3448, 33716, 21760]):
+        assert L.trae_focus_uri(3448) == (
+            "trae-cn://cc-light.cc-light-helper/focus?pid=3448&pid=33716&pid=21760"
+        )
+
+
+def test_trae_focus_uri_invalid_pid():
+    assert L.trae_focus_uri(0) is None
+    assert L.trae_focus_uri(None) is None
 
 
 def test_get_session_title_invalid():

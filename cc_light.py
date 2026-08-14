@@ -1076,6 +1076,13 @@ def _ancestor_pids(pid, max_depth=8):
     return out
 
 
+def trae_focus_uri(pid):
+    pids = _ancestor_pids(pid)
+    if not pids:
+        return None
+    return "trae-cn://cc-light.cc-light-helper/focus?" + "&".join("pid=" + str(p) for p in pids)
+
+
 def find_window_by_pid(pid):
     """按进程 PID 沿【父链】找一个可见顶层窗口。termpid 是 powershell(无窗口),真正的终端/
     编辑器窗口在祖父(WindowsTerminal/Trae 主进程),所以收集 termpid 及其祖先 pid,一次
@@ -1526,7 +1533,9 @@ def run_gui():
                               % (sid[:8], _nm, _h, _t))
                 if _t and _sh and _is_trae_wnd(tgt):
                     try:
-                        os.startfile("trae-cn://cc-light.cc-light-helper/focus?pid=" + str(_t))
+                        uri = trae_focus_uri(_t)
+                        if uri:
+                            os.startfile(uri)
                     except Exception:
                         pass
                 break
