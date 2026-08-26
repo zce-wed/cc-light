@@ -1151,6 +1151,19 @@ def _window_process_name(hwnd):
     return ""
 
 
+def _window_title(hwnd):
+    """窗口标题(GetWindowTextW),取不到返回空串。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        tb = ctypes.create_unicode_buffer(512)
+        return tb.value if u.GetWindowTextW(hwnd, tb, 512) else ""
+    except Exception:
+        return ""
+
+
 def _is_trae_wnd(hwnd):
     """窗口是否属于 Trae 进程。trae-cn:// URI 只该对 Trae 多终端发:WT 多 tab 也共享宿主窗口 hwnd,
     误判 shared 发 URI → Trae helper 兜底 workbench.action.terminal.focus 激活 Trae 抢前台,把刚 focus
@@ -2632,9 +2645,108 @@ def run_gui():
         try: mb.showinfo("恢复上下文栏", "已把 statusLine 写回 settings.json(取自 " + src + ")。\n上下文栏应在 ~1 秒内恢复;若没动静,重开当前会话即可。")
         except Exception: pass
 
+    def fix_term_window():
+        """手动修正会话跳转的终端窗口。hook 记 hwnd 用「首次 GetForegroundWindow + 旧值存活
+        守卫」:hook 触发那一刻前台是谁就记谁,claude 启动时用户已切走/后台启动就记错;记错后
+        只要窗口活着就一直保留(跳错窗口)。本功能:选会话 → 5 秒内切到正确终端窗口 → 到点抓
+        前台写回 session 文件,下次点击即跳对。局限:WT 多 tab 共享 hwnd,只能 focus 到窗口级,
+        显示哪个 tab 由 WT 决定(Trae 有 helper 能切终端,WT 无等价机制)。"""
+        import tkinter.messagebox as mb
+        try:
+            files = sorted(f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json"))
+        except OSError:
+            files = []
+        items = []
+        for fn in files:
+            try:
+                with open(os.path.join(SESSIONS_DIR, fn), encoding="utf-8") as f:
+                    d = json.load(f)
+                items.append((fn[:-5], d))
+            except Exception:
+                continue
+        if not items:
+            try: mb.showinfo("修正终端窗口", "当前没有会话记录。")
+            except Exception: pass
+            return
+
+        pw = tk.Toplevel(root)
+        pw.title("修正终端窗口")
+        pw.attributes("-topmost", True)
+        pw.transient(root)
+        pw.configure(bg="#2a2a2a")
+        pw.geometry("460x300")
+        tk.Label(pw, text="选中跳错位置的会话 → 开始抓取 → 5 秒内切到它真正的终端窗口",
+                 fg="#9a9a9a", bg="#2a2a2a", font=("Microsoft YaHei", 8)).pack(padx=10, pady=6)
+        lb = tk.Listbox(pw, bg="#1e1e1e", fg="#dcdcdc", selectbackground="#4a6fa5",
+                        selectforeground="#ffffff", font=("Microsoft YaHei", 9),
+                        relief="flat", highlightthickness=0)
+        lb.pack(fill="both", expand=True, padx=10, pady=4)
+        for _sid, _d in items:
+            cur = _window_title(_d.get("hwnd") or 0) or "(hwnd 失效)"
+            lb.insert("end", " %s  →  %s" % (_d.get("name") or _sid[:8], cur[:64]))
+
+        def _grab(sid, d):
+            pw.destroy()
+            gw = tk.Toplevel(root)
+            gw.title("抓取前台窗口")
+            gw.attributes("-topmost", True)
+            gw.transient(root)
+            gw.configure(bg="#2a2a2a")
+            lbl = tk.Label(gw, text="", fg="#e8e8e8", bg="#2a2a2a",
+                           font=("Microsoft YaHei", 11, "bold"), padx=26, pady=16)
+            lbl.pack()
+            state = {"n": 5}
+
+            def _tick():
+                if state["n"] > 0:
+                    lbl.config(text="请在 %d 秒内点击切换到\n「%s」所在的终端窗口" % (state["n"], d.get("name") or sid[:8]))
+                    state["n"] -= 1
+                    gw.after(1000, _tick)
+                    return
+                hwnd = 0
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    u = ctypes.windll.user32
+                    u.GetForegroundWindow.argtypes = []; u.GetForegroundWindow.restype = wintypes.HWND
+                    u.IsWindowVisible.argtypes = [wintypes.HWND]; u.IsWindowVisible.restype = wintypes.BOOL
+                    h = u.GetForegroundWindow()
+                    if h and u.IsWindowVisible(h):
+                        hwnd = int(h)
+                except Exception as ex:
+                    log_error(ex, "fix_term_window grab")
+                try: gw.destroy()
+                except Exception: pass
+                if not hwnd or "python" in _window_process_name(hwnd).lower():
+                    try: mb.showwarning("修正终端窗口", "没抓到目标窗口(5 秒内没切换,前台还是本工具或已不可见),请重试。")
+                    except Exception: pass
+                    return
+                d["hwnd"] = hwnd
+                _write_session_file(sid, d)
+                try: mb.showinfo("修正终端窗口", "已把「%s」的跳转窗口改为:\n%s  (%s)\n下次点击该会话即跳这个窗口。"
+                                 % (d.get("name") or sid[:8], _window_title(hwnd), _window_process_name(hwnd)))
+                except Exception: pass
+
+            _tick()
+
+        def _start():
+            sel = lb.curselection()
+            if not sel:
+                try: mb.showinfo("修正终端窗口", "先选中一个会话。")
+                except Exception: pass
+                return
+            _grab(*items[sel[0]])
+
+        bar = tk.Frame(pw, bg="#2a2a2a")
+        bar.pack(fill="x", padx=10, pady=6)
+        tk.Button(bar, text="开始抓取", command=_start, bg="#3a3a3a", fg="#e8e8e8",
+                  activebackground="#4a4a4a", relief="flat", bd=0,
+                  font=("Microsoft YaHei", 9), padx=14).pack(side="right")
+
     menu.add_separator()
     menu.add_checkbutton(label="窗口置顶", variable=topmost_var, command=on_toggle_topmost)
     menu.add_command(label="复位位置", command=lambda: root.geometry(default_geo()))
+    menu.add_command(label="修正终端窗口", command=fix_term_window)
     menu.add_separator()
     menu.add_command(label="恢复上下文栏", command=restore_statusline)
     menu.add_command(label="重启", command=restart)
