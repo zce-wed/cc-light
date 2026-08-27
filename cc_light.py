@@ -1028,6 +1028,10 @@ def find_window_by_name(name):
             # 标题里 name 单独成段(典型 'file - name - Trae CN')比单纯子串更可信
             if (" - " + target + " - ") in tl or tl.startswith(target + " -") or tl.endswith(" - " + target) or tl == target:
                 score += 3
+            # 标题尾段恰好是项目名(如 TAPD 专用执行终端 'TAPD-exec <name>'):是专为该项目开的
+            # 会话终端,比同名项目的编辑器窗口(Trae 中间段模式)更属于该会话,hwnd 失效兜底时优先
+            if tl.endswith(" " + target):
+                score += 4
             if score > best[1]:
                 best[0] = hwnd; best[1] = score
             return True

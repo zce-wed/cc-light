@@ -8,31 +8,21 @@ const { execFileSync } = require('child_process');
 
 // 一次 powershell 同时刷新 hwnd + termpid(hook 每次工具调用都触发,合并避免两次进程启动)。
 // 关键:hwnd/termpid 必须在窗口/终端重建后自动刷新 —— 旧实现 `old.hwnd || get()` 是旧值优先,
-// 一旦首次记下就永不更新,窗口重建后留下死 hwnd,点击跳转失效。这里用"新值优先 + 存活守卫":
-// 旧 hwnd 还活着(IsWindow)/旧 termpid 进程还在 → 保留(廉价,不遍历父链);否则沿父链重取。
-function getMeta(prevHwnd, prevPid) {
-    const script = [
-        '$ErrorActionPreference="SilentlyContinue"',
-        'Add-Type -MemberDefinition \'[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h); [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);\' -Name U -Namespace CCL -PassThru | Out-Null',
-        // ---- hwnd:旧值存活则保留,否则重取(GetForegroundWindow 快速路径 → 父链兜底) ----
-        '$hwnd=0; $prev=[int64]$env:PREV_HWND',
-        'if($prev -and [CCL.U]::IsWindow([IntPtr]$prev)){ $hwnd=$prev }',
-        'else{',
-        '  $term="WindowsTerminal|conhost|cmd|Code|Trae|Cursor|Windsurf|wezterm|alacritty|Hyper|conemu64|HBuilderX"',
-        '  $fg=[CCL.U]::GetForegroundWindow()',
-        '  if($fg -and $fg -ne 0){ $pv=0; [void][CCL.U]::GetWindowThreadProcessId($fg,[ref]$pv); $fp=Get-Process -Id $pv; if($fp -and $fp.Name -match $term){ $hwnd=[int64]$fg } }',
-        '  if(-not $hwnd){ $p=$PID; $first=0; while($p){ $pr=Get-CimInstance Win32_Process -Filter ("ProcessId="+$p); if(-not $pr){break}; $proc=Get-Process -Id $p; if($proc -and $proc.MainWindowHandle -and $proc.MainWindowHandle -ne 0){ if($first -eq 0){$first=[int64]$proc.MainWindowHandle}; if($proc.Name -match $term){$hwnd=[int64]$proc.MainWindowHandle;break} }; $p=$pr.ParentProcessId }; if(-not $hwnd -and $first){ $hwnd=$first } }',
-        '}',
-        // ---- termpid:旧进程还在则保留,否则沿父链找 name 含 claude 的进程,取其父 ----
-        '$tpid=0; $prevT=[int64]$env:PREV_TPID',
-        'if($prevT -and (Get-Process -Id $prevT)){ $tpid=$prevT }',
-        'else{ $p=$PID; while($p){ $pr=Get-CimInstance Win32_Process -Filter ("ProcessId="+$p); if(-not $pr){break}; $proc=Get-Process -Id $p; if($proc -and $proc.Name -match "claude"){ $tpid=[int64]$pr.ParentProcessId; break }; $p=$pr.ParentProcessId } }',
-        '[Console]::Write($hwnd.ToString()+"`t"+$tpid.ToString())'
-    ].join('\n');
+// 一旦首次记下就永不更新,窗口重建后留下死 hwnd,点击跳转失效。这里用"新值优先 + 存活守卫"。
+// 实现挪到 hook_meta.ps1(PS5.1 读 ps1 要 BOM),逻辑升级:
+//  1) 归属校验:旧 hwnd 活着还要其所属进程在当前父链上才算数 —— resume/迁移场景旧值指向
+//     别的窗口(如 Trae)时判失效强制重取,错值可自愈;
+//  2) WT 单进程多窗口:MainWindowHandle 只是其中一个窗口 → EnumWindows 枚举该 pid 全部
+//     可见顶层窗口,标题含项目名(name)者优先(TAPD-exec <项目名> 命中)。
+function getMeta(prevHwnd, prevPid, name) {
     try {
-        const out = execFileSync('powershell', ['-NoProfile', '-Command', script],
+        const out = execFileSync('powershell',
+            ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'hook_meta.ps1')],
             { encoding: 'utf8', timeout: 10000, windowsHide: true,
-              env: Object.assign({}, process.env, { PREV_HWND: String(prevHwnd || 0), PREV_TPID: String(prevPid || 0) }) });
+              env: Object.assign({}, process.env, {
+                  PREV_HWND: String(prevHwnd || 0),
+                  PREV_TPID: String(prevPid || 0),
+                  NAME: String(name || '') }) });
         const parts = String(out).trim().split(/\s+/);
         const h = parseInt(parts[0], 10), t = parseInt(parts[1], 10);
         return { hwnd: (isNaN(h) ? 0 : h), termpid: (isNaN(t) ? 0 : t) };
@@ -95,7 +85,7 @@ const now = Date.now() / 1000;
 // subagent start: subs+1, write yellow (a subagent running => the session is busy)
 if (action === 'sub_start') {
     const old = readSession(sid) || {};
-    const meta = getMeta(old.hwnd, old.termpid);
+    const meta = getMeta(old.hwnd, old.termpid, name);
     writeSession(sid, { state: 'yellow', msg: '', ts: now, name: name, subs: (old.subs || 0) + 1, hwnd: meta.hwnd || old.hwnd || 0, termpid: meta.termpid || old.termpid || 0 });
     process.exit(0);
 }
@@ -119,7 +109,7 @@ const old = readSession(sid);
 // SOFT(工具心跳)跳过 getMeta:hwnd/termpid 沿用旧值,避免 Claude 每个工具都起 powershell 拖慢响应
 const meta = SOFT
     ? { hwnd: (old && old.hwnd) || 0, termpid: (old && old.termpid) || 0 }
-    : getMeta(old && old.hwnd, old && old.termpid);
+    : getMeta(old && old.hwnd, old && old.termpid, name);
 writeSession(sid, {
     state: action,
     msg: '',
