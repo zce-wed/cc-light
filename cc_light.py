@@ -17,6 +17,7 @@ import os
 import json
 import time
 import math
+from datetime import datetime
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 # 运行数据放 %APPDATA%\cc-light —— ~/.claude 被坚果云同步会清空 sessions,必须移出
@@ -33,6 +34,13 @@ MAX_HISTORY = 500   # 历史上限(超出截断最旧的)
 STALE = 1 * 3600        # 1 小时无更新 → 归档(可被「检测所有会话」还原)
 SCAN_ACTIVE = 6 * 3600  # 「检测所有会话」:jsonl 6h 内有写入视为会话仍开着(覆盖午休等长空闲)
 SCANNED_ACTIVE = 60     # scanned 会话(无 hook 心跳)按 jsonl mtime 判忙/闲:60s 内有写=运行中(yellow),否则空闲(green)
+CODEX_SESSIONS_DIR = os.path.join(os.path.expanduser("~"), ".codex", "sessions")
+CODEX_INDEX_FILE = os.path.join(os.path.expanduser("~"), ".codex", "session_index.jsonl")
+CODEX_LOCKS_DIR = os.path.join(os.path.expanduser("~"), ".codex", "thread-writer-locks")
+CODEX_SCAN_INTERVAL = 3
+CODEX_ARCHIVED_FILE = os.path.join(DATA_DIR, "codex-archived.json")
+_CODEX_CACHE = {"checked": 0, "sessions": {}, "logs": {}}
+_CODEX_TITLES = {"mtime": None, "titles": {}}
 DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
 ERROR_LOG = os.path.join(DATA_DIR, "error.log")          # 异常日志(右键「错误日志」查看,复制丢给排查)
 MAX_ERROR_LOG = 200   # 异常日志保留最近 N 条(超 500KB 自动截断)
@@ -455,6 +463,68 @@ def archive_session(sid):
         pass
 
 
+def _read_codex_archived():
+    """Return Codex sessions hidden from the cc-light list by the user."""
+    try:
+        with open(CODEX_ARCHIVED_FILE, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return {sid for sid in value if isinstance(sid, str)} if isinstance(value, list) else set()
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def archive_codex_session(sid):
+    """Hide a dynamically scanned Codex session without touching its rollout log."""
+    archived = _read_codex_archived()
+    archived.add(sid)
+    try:
+        ensure_dir()
+        tmp = CODEX_ARCHIVED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(archived), f)
+        try:
+            os.replace(tmp, CODEX_ARCHIVED_FILE)
+        except OSError:
+            # Some managed Windows folders deny rename-on-close; preserve the
+            # marker with the same direct-write fallback used by other settings.
+            with open(CODEX_ARCHIVED_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(archived), f)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def remove_inactive_scanned_sessions(active):
+    """Drop persisted sessions created by the manual session scan when closed.
+
+    Scanned sessions do not have a hook to remove their state on SessionEnd, so
+    they must be reconciled against the current process scan after startup.
+    """
+    active = set(active or ())
+    try:
+        files = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return
+    for fn in files:
+        if not fn.endswith(".json"):
+            continue
+        sid = fn[:-5]
+        path = os.path.join(SESSIONS_DIR, fn)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if d.get("scanned") and sid not in active:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def _refresh_scanned_state(d, now):
     """scanned 会话无 hook 心跳,按其 jsonl 最后写入判忙/闲:
     jsonl 近期(SCANNED_ACTIVE 内)有写 → 运行中(yellow);停了 → 空闲(green)。
@@ -470,6 +540,286 @@ def _refresh_scanned_state(d, now):
     d["ts"] = mtime
 
 
+def _codex_process_starts():
+    """Return {pid: creation_time} for live codex.exe processes on Windows."""
+    out = {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        pids = (wintypes.DWORD * 4096)()
+        used = wintypes.DWORD()
+        if not psapi.EnumProcesses(ctypes.byref(pids), ctypes.sizeof(pids), ctypes.byref(used)):
+            return out
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        for pid in pids[:used.value // ctypes.sizeof(wintypes.DWORD)]:
+            if not pid:
+                continue
+            handle = kernel.OpenProcess(0x1000, False, pid)
+            if not handle:
+                continue
+            try:
+                image = ctypes.create_unicode_buffer(1024)
+                length = wintypes.DWORD(len(image))
+                if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
+                    continue
+                if os.path.basename(image.value).lower() != "codex.exe":
+                    continue
+                created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+                if kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                          ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                    ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                    out[int(pid)] = ticks / 10_000_000 - 11_644_473_600
+            finally:
+                kernel.CloseHandle(handle)
+    except Exception:
+        pass
+    return out
+
+
+def _codex_session_owners(processes):
+    """Find live writers, including resumed threads served by the shared daemon.
+
+    None means this Codex/Windows version cannot provide writer ownership.
+    An empty dict means ownership was checked and no live writers were found.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        files = os.listdir(CODEX_LOCKS_DIR)
+        kernel = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        class IO_STATUS_BLOCK(ctypes.Structure):
+            _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+        class FILE_PROCESS_IDS(ctypes.Structure):
+            _fields_ = [("count", wintypes.ULONG), ("pids", ctypes.c_size_t * 256)]
+
+        ntdll.NtQueryInformationFile.argtypes = [wintypes.HANDLE,
+            ctypes.POINTER(IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG]
+        out = {}
+        for filename in files:
+            if filename.startswith(".") or not filename.endswith(".lock"):
+                continue
+            path = os.path.join(CODEX_LOCKS_DIR, filename)
+            handle = kernel.CreateFileW(path, 0x80, 7, None, 3, 0, None)
+            if handle == ctypes.c_void_p(-1).value:
+                continue
+            try:
+                status, ids = IO_STATUS_BLOCK(), FILE_PROCESS_IDS()
+                # FileProcessIdsUsingFileInformation is a read-only handle-owner query.
+                if ntdll.NtQueryInformationFile(handle, ctypes.byref(status),
+                        ctypes.byref(ids), ctypes.sizeof(ids), 47):
+                    return None
+                owners = [int(pid) for pid in ids.pids[:ids.count] if pid in processes]
+                if owners:
+                    out[filename[:-5]] = {"pid": owners[0], "ts": os.path.getmtime(path)}
+            except OSError:
+                continue
+            finally:
+                kernel.CloseHandle(handle)
+        return out
+    except (OSError, AttributeError):
+        return None
+
+
+def _codex_process_context(pid):
+    """Read the command line and cwd to locate a daemon thread's terminal client."""
+    out = {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+        ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, wintypes.ULONG,
+            ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+
+        class UNICODE_STRING(ctypes.Structure):
+            _fields_ = [("length", wintypes.USHORT), ("maximum", wintypes.USHORT),
+                        ("buffer", ctypes.c_void_p)]
+
+        class PBI(ctypes.Structure):
+            _fields_ = [("r1", ctypes.c_void_p), ("peb", ctypes.c_void_p),
+                        ("r2", ctypes.c_void_p * 2), ("pid", ctypes.c_void_p),
+                        ("parent", ctypes.c_void_p)]
+
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if handle:
+            try:
+                buf = ctypes.create_string_buffer(32768)
+                if not ntdll.NtQueryInformationProcess(handle, 60, buf, len(buf), None):
+                    command = UNICODE_STRING.from_buffer(buf)
+                    out["command"] = ctypes.wstring_at(command.buffer, command.length // 2)
+            finally:
+                kernel.CloseHandle(handle)
+        handle = kernel.OpenProcess(0x410, False, pid)
+        if handle:
+            try:
+                pbi = PBI()
+                if ntdll.NtQueryInformationProcess(handle, 0, ctypes.byref(pbi),
+                                                  ctypes.sizeof(pbi), None) or not pbi.peb:
+                    return out
+                params, read = ctypes.c_void_p(), ctypes.c_size_t()
+                params_offset = 0x20 if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x10
+                cwd_offset = 0x38 if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x24
+                if not kernel.ReadProcessMemory(handle, pbi.peb + params_offset,
+                        ctypes.byref(params), ctypes.sizeof(params), ctypes.byref(read)):
+                    return out
+                cwd = UNICODE_STRING()
+                if kernel.ReadProcessMemory(handle, params.value + cwd_offset,
+                        ctypes.byref(cwd), ctypes.sizeof(cwd), ctypes.byref(read)) and cwd.buffer:
+                    buf = ctypes.create_unicode_buffer(cwd.length // 2 + 1)
+                    if kernel.ReadProcessMemory(handle, cwd.buffer, buf, cwd.length,
+                                                ctypes.byref(read)):
+                        out["cwd"] = os.path.normcase(os.path.normpath(buf.value))
+            finally:
+                kernel.CloseHandle(handle)
+    except (OSError, AttributeError, ValueError, TypeError):
+        pass
+    return out
+
+
+def _codex_log_state(path, cache):
+    """Read new complete JSONL lines and track the latest turn event."""
+    try:
+        if os.path.getsize(path) < cache.get("offset", 0):
+            cache.clear()
+        with open(path, "rb") as stream:
+            if not cache.get("meta"):
+                first = json.loads(stream.readline())
+                if first.get("type") != "session_meta":
+                    return None
+                cache["meta"] = first.get("payload", {})
+                cache["offset"] = stream.tell()
+            stream.seek(cache["offset"])
+            while True:
+                line = stream.readline()
+                if not line or not line.endswith(b"\n"):
+                    break
+                cache["offset"] = stream.tell()
+                if not any(marker in line for marker in (b'"task_started"', b'"task_complete"', b'"turn_aborted"')):
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("type") == "event_msg":
+                    kind = event.get("payload", {}).get("type")
+                    if kind in ("task_started", "task_complete", "turn_aborted"):
+                        cache["state"] = "yellow" if kind == "task_started" else "green"
+    except (OSError, ValueError, TypeError):
+        return None
+    return cache.get("meta")
+
+
+def scan_codex_sessions(now=None):
+    """Collect Codex rollouts owned by a currently running codex.exe."""
+    now = time.time() if now is None else now
+    if now - _CODEX_CACHE["checked"] < CODEX_SCAN_INTERVAL:
+        return _CODEX_CACHE["sessions"]
+    processes = _codex_process_starts()
+    result = {}
+    archived = _read_codex_archived()
+    if processes:
+        owners = _codex_session_owners(processes)
+        contexts = {pid: _codex_process_context(pid) for pid in processes}
+        clients = {pid: created for pid, created in processes.items()
+                   if "app-server" not in contexts[pid].get("command", "")}
+        try:
+            years = os.listdir(CODEX_SESSIONS_DIR)
+        except OSError:
+            years = []
+        for year in years:
+            if not year.isdigit() or (owners is None and int(year) < datetime.fromtimestamp(now).year - 1):
+                continue
+            for root, _dirs, files in os.walk(os.path.join(CODEX_SESSIONS_DIR, year)):
+                for fn in files:
+                    if not fn.startswith("rollout-") or not fn.endswith(".jsonl"):
+                        continue
+                    path = os.path.join(root, fn)
+                    # The filename lets us skip history without parsing its large metadata.
+                    filename_sid = fn[-42:-6]
+                    if owners is not None and filename_sid not in owners:
+                        continue
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        continue
+                    if owners is None and (not clients or mtime < min(clients.values()) - 30):
+                        continue
+                    entry = _CODEX_CACHE["logs"].setdefault(path, {})
+                    meta = _codex_log_state(path, entry)
+                    if not meta:
+                        continue
+                    sid = meta.get("id") or meta.get("session_id")
+                    if not sid:
+                        continue
+                    if sid in archived:
+                        continue
+                    cwd = meta.get("cwd") or ""
+                    if owners is not None:
+                        owner = owners.get(sid)
+                        if not owner:
+                            continue
+                        pid = owner["pid"]
+                        if "app-server" in contexts[pid].get("command", ""):
+                            candidates = [client for client in clients if
+                                contexts[client].get("cwd") == os.path.normcase(os.path.normpath(cwd))]
+                            if candidates:
+                                pid = min(candidates, key=lambda p: abs(owner["ts"] - clients[p]))
+                    else:
+                        try:
+                            started = datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00")).timestamp()
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        matches = [(abs(started - created), client) for client, created in clients.items()
+                                   if -2 <= started - created <= 30]
+                        if not matches:
+                            continue
+                        _delta, pid = min(matches)
+                    name = os.path.basename(cwd.replace("\\", "/").rstrip("/")) or sid[:8]
+                    result[sid] = {"provider": "codex", "state": entry.get("state", "green"),
+                                   "ts": mtime, "name": name, "termpid": pid,
+                                   "jsonl": path, "hwnd": 0, "subs": 0}
+    _CODEX_CACHE.update(checked=now, sessions=result)
+    return result
+
+
+def get_codex_title(sid):
+    try:
+        mtime = os.path.getmtime(CODEX_INDEX_FILE)
+        if _CODEX_TITLES["mtime"] != mtime:
+            titles = {}
+            with open(CODEX_INDEX_FILE, "r", encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        item = json.loads(line)
+                        if item.get("id") and item.get("thread_name"):
+                            titles[item["id"]] = item["thread_name"]
+                    except ValueError:
+                        continue
+            _CODEX_TITLES.update(mtime=mtime, titles=titles)
+        return _CODEX_TITLES["titles"].get(sid, "")
+    except OSError:
+        return ""
+
+
 def read_sessions(now=None):
     ensure_dir()
     now = now if now is not None else time.time()
@@ -477,7 +827,7 @@ def read_sessions(now=None):
     try:
         files = os.listdir(SESSIONS_DIR)
     except OSError:
-        return out
+        files = []
     for fn in files:
         if not fn.endswith(".json"):
             continue
@@ -493,17 +843,24 @@ def read_sessions(now=None):
                     pass
                 continue
             if d.get("scanned"):
+                if d.get("termpid") and not is_process_alive(d["termpid"]):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                    continue
                 _refresh_scanned_state(d, now)   # 无 hook 心跳 → 按 jsonl mtime 实时判忙/闲
             out[fn[:-5]] = d
         except Exception:
             continue
+    out.update(scan_codex_sessions(now))
     return out
 
 
 def effective_state(d, now=None):
     """单会话有效状态(按 config 应用超时降级)"""
     s = d.get("state", "gray")
-    if (s == "yellow" and _config["timeout_fallback"]
+    if (s == "yellow" and d.get("provider") != "codex" and _config["timeout_fallback"]
             and (now if now is not None else time.time()) - d.get("ts", 0) > _config["yellow_timeout"]):
         s = "green"
     return s
@@ -983,12 +1340,12 @@ def focus_window(hwnd):
         return False
 
 
-def find_window_by_name(name):
+def find_window_by_name(name, process_keyword=None):
     """hwnd 失效时的兜底:按项目名模糊匹配当前可见的顶层窗口。
     Trae/VSCode reload 或窗口重建后 hwnd 会变,记录的旧 hwnd 就死了;这时用会话的项目名
     去匹配窗口标题(如 'PortraitEdit.vue - zc-geo-frontend - Trae CN' 含 'zc-geo-frontend'),
     返回真实可见窗口的 hwnd,没有则返回 None。"""
-    if not name or len(name) < 2:
+    if (not name or len(name) < 2) and not process_keyword:
         return None
     try:
         import ctypes
@@ -1011,13 +1368,17 @@ def find_window_by_name(name):
             if not u.IsWindowVisible(hwnd) or u.GetParent(hwnd):
                 return True
             n = u.GetWindowTextLengthW(hwnd)
-            if n <= 0:
+            if n <= 0 and not process_keyword:
                 return True
             tb = ctypes.create_unicode_buffer(n + 1)
             u.GetWindowTextW(hwnd, tb, n + 1)
             title = tb.value
-            if not title or target not in title.lower():
+            if target and (not title or target not in title.lower()):
                 return True
+            if process_keyword:
+                pname = (_window_process_name(hwnd) or "").lower()
+                if process_keyword.lower() not in pname:
+                    return True
             cb = ctypes.create_unicode_buffer(256)
             u.GetClassNameW(hwnd, cb, 256)
             cls = cb.value
@@ -1040,6 +1401,12 @@ def find_window_by_name(name):
         return best[0]
     except Exception:
         return None
+
+
+def find_trae_window(name):
+    """Find the Trae workbench for a project title."""
+    return (find_window_by_name(name, process_keyword="trae") or
+            find_window_by_name(None, process_keyword="trae"))
 
 
 def _ancestor_pids(pid, max_depth=8):
@@ -1123,6 +1490,34 @@ def find_window_by_pid(pid):
         return None
 
 
+def _focus_browser():
+    """把已打开的浏览器窗口(Chrome/Edge)带到前台——不新开 tab,配合焦点文件由页面自行切项目。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.IsWindowVisible.argtypes = [wintypes.HWND]; u.IsWindowVisible.restype = wintypes.BOOL
+        u.GetParent.argtypes = [wintypes.HWND]; u.GetParent.restype = wintypes.HWND
+        ENUMWNDPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u.EnumWindows.argtypes = [ENUMWNDPROC, wintypes.LPARAM]; u.EnumWindows.restype = wintypes.BOOL
+        found = [None]
+
+        def _cb(hwnd, _lp):
+            if not u.IsWindowVisible(hwnd) or u.GetParent(hwnd):
+                return True
+            n = (_window_process_name(hwnd) or "").lower()
+            if n in ("chrome.exe", "msedge.exe"):
+                found[0] = hwnd
+                return False
+            return True
+
+        u.EnumWindows(ENUMWNDPROC(_cb), 0)
+        if found[0]:
+            focus_window(found[0])
+    except Exception:
+        pass
+
+
 def _window_process_name(hwnd):
     """窗口所属进程的可执行文件名(如 'Trae CN.exe'/'WindowsTerminal.exe')。"""
     try:
@@ -1173,6 +1568,39 @@ def _is_trae_wnd(hwnd):
     误判 shared 发 URI → Trae helper 兜底 workbench.action.terminal.focus 激活 Trae 抢前台,把刚 focus
     的 WT 挤走(表现为「点 WT 会话,窗口出来几秒后又最小化」)。"""
     return "trae" in _window_process_name(hwnd).lower()
+
+
+def jump_codex_session(pid, name):
+    """Focus the matching Trae workbench and select its terminal."""
+    # Codex is often launched by a Windows Terminal process. That parent window
+    # is alive, but it is not the Trae workbench the user expects to return to.
+    target = find_trae_window(name) if name else None
+    if target:
+        focused = focus_window(target)
+        try:
+            uri = trae_focus_uri(pid)
+            if uri:
+                os.startfile(uri)
+                return bool(focused)
+        except Exception as exc:
+            log_error(exc, "Codex Trae 终端跳转失败")
+        return bool(focused)
+
+    target = find_window_by_pid(pid) if pid else None
+    if not target:
+        target = find_window_by_name(name)
+    if not target:
+        return False
+    focused = focus_window(target)
+    if pid and _is_trae_wnd(target):
+        try:
+            uri = trae_focus_uri(pid)
+            if uri:
+                os.startfile(uri)
+                return bool(focused)
+        except Exception as exc:
+            log_error(exc, "Codex Trae 终端跳转失败")
+    return bool(focused)
 
 
 def resolve_hwnd(hwnd, name):
@@ -1535,19 +1963,42 @@ def run_gui():
                 drag_card[0] = None
 
         def _do_jump(sid):                            # 短按:跳该会话窗口(失败记日志,成功不记)
-            for _s, _r, _h, _t, _sh, _nm in rows_info:
+            for _s, _r, _h, _t, _sh, _nm, _sc in rows_info:
                 if _s != sid:
                     continue
-                tgt = resolve_hwnd(_h, _nm)
-                if not tgt and _t:
-                    tgt = find_window_by_pid(_t)
+                if sessions.get(sid, {}).get("provider") == "codex":
+                    if not jump_codex_session(_t, sessions[sid].get("name") or ""):
+                        log_error(None, "Codex 跳转失败: sid=%s pid=%s name=%r"
+                                  % (sid[:8], _t, _nm))
+                    break
+                # scanned=后台隐藏任务:不做任何窗口查找 —— 按项目名兜底会误中同名的 IDE 窗口,
+                # 按父链会误中后端宿主窗口;直接走焦点文件+打开管理页
+                tgt = None
+                if not _sc:
+                    tgt = resolve_hwnd(_h, _nm)
+                    if not tgt and _t:
+                        tgt = find_window_by_pid(_t)
                 if tgt:
                     if not focus_window(tgt):
                         log_error(None, "跳转 focus 失败(前台锁定?): sid=%s name=%r hwnd=%s tgt=%s"
                                   % (sid[:8], _nm, _h, tgt))
                 else:
-                    log_error(None, "跳转找不到窗口: sid=%s name=%r hwnd=%s termpid=%s"
-                              % (sid[:8], _nm, _h, _t))
+                    # 后台隐藏任务(ProjectManager 管理页 spawn 的 claude,无终端窗口):
+                    # 写焦点文件(页面 2s 内自动切对应项目) + 打开/跳转管理页
+                    log_error(None, "跳转找不到窗口(后台任务→切管理页): sid=%s name=%r termpid=%s"
+                              % (sid[:8], _nm, _t))
+                    try:
+                        import json, time
+                        with open(r"C:\Users\zhongce-pm\Desktop\newWork\ProjectManager\data\tapd_sync\focus.json",
+                                  "w", encoding="utf-8") as _f:
+                            json.dump({"sid": sid, "proj": _nm or "", "ts": int(time.time() * 1000)}, _f)
+                    except Exception:
+                        pass
+                    try:
+                        import webbrowser
+                        webbrowser.open("http://192.168.1.165:3667/#/work/tapd")
+                    except Exception:
+                        pass
                 if _t and _sh and _is_trae_wnd(tgt):
                     try:
                         uri = trae_focus_uri(_t)
@@ -1613,18 +2064,21 @@ def run_gui():
             stale = (raw == "yellow" and st == "green")
             color = COLORS.get(st, {}).get("on", "#666666")
             name = d.get("name") or sid[:8]
+            if d.get("provider") == "codex":
+                name = "Codex · " + name
             multi = names.count(d.get("name", "")) > 1
             hwnd = d.get("hwnd")
             termpid = d.get("termpid")
             shared = hwnd_count.get(hwnd, 0) > 1
             row = tk.Frame(win, bg=BG)
             row.grid(row=i, column=0, sticky="w", padx=6, pady=1)
-            rows_info.append((sid, row, hwnd, termpid, shared, name))
+            rows_info.append((sid, row, hwnd, termpid, shared, name, bool(d.get("scanned"))))
             tk.Label(row, text="●", fg=color, bg=BG, font=_detail_fonts["dot"]).pack(side="left")
             word = STATE_WORD.get(st, "") + (" ·超时" if stale else "")
             tk.Label(row, text=" " + word, fg=color, bg=BG, font=_detail_fonts["word"]).pack(side="left")
             tk.Label(row, text="  " + name, fg="#dddddd", bg=BG, font=_detail_fonts["name"]).pack(side="left")
-            _title = get_session_title(sid, d.get("jsonl"))   # 任务标签(最近一次对话的任务)
+            _title = (get_codex_title(sid) if d.get("provider") == "codex"
+                      else get_session_title(sid, d.get("jsonl")))   # 任务标签
             _label = _title or ("#" + sid[:4] if multi else "")  # 无标题:多会话用 sid 区分,单会话省略
             if _label:
                 _disp = (_title[:20] + "…") if (len(_title) > 20) else _label   # 超 20 字截断,悬浮看全
@@ -1646,7 +2100,12 @@ def run_gui():
                             activebackground="#3a3a3a", activeforeground="#ffffff")
                 def _do():
                     detail_menu_active[0] = False
-                    archive_session(s)
+                    if sessions.get(s, {}).get("provider") == "codex":
+                        archive_codex_session(s)
+                        _CODEX_CACHE["checked"] = 0
+                        _CODEX_CACHE["sessions"].pop(s, None)
+                    else:
+                        archive_session(s)
                     close_details()
                     root.after(20, details_hover)
                 m.add_command(label="删除该会话", command=_do)
@@ -1696,11 +2155,33 @@ def run_gui():
         win.bind("<Leave>", lambda e: schedule_close())
 
     def cleanup_stale():
-        """归档超过超时阈值无更新的会话(归档而非真删,可用「检测所有会话」还原)。"""
+        """归档超过超时阈值无更新的会话(归档而非真删,可用「检测所有会话」还原)。
+        scanned 会话(无 hook 心跳)不按 ts 归档 —— 其 ts 被 _refresh_scanned_state 同步成
+        jsonl mtime,claude 跑长工具停更几十秒属正常,按 ts 归档会和后端心跳形成删/写循环
+        (会话点反复闪现)。只在 jsonl 停更超 1 小时(真死)才清。"""
         thr = _config["yellow_timeout"]
         now = time.time()
         for sid, d in list(read_sessions().items()):
+            if d.get("provider") == "codex":
+                continue
+            if d.get("scanned"):
+                j = d.get("jsonl")
+                if j:
+                    try:
+                        if now - os.path.getmtime(j) > 3600:
+                            archive_session(sid)
+                    except OSError:
+                        pass
+                continue
             if now - d.get("ts", 0) > thr:
+                tp = d.get("termpid")
+                if tp and is_process_alive(tp):
+                    try:
+                        d["ts"] = now
+                        _write_session_file(sid, d)
+                    except Exception:
+                        pass
+                    continue
                 archive_session(sid)
         sessions = read_sessions()
         c, n = aggregate(sessions)
@@ -1749,22 +2230,7 @@ def run_gui():
                 "jsonl": info.get("jsonl", ""), "scanned": True,
             })
         # 清理:scanned 会话其进程已没了(不在 active) → 删
-        try:
-            for fn in os.listdir(SESSIONS_DIR):
-                if not fn.endswith(".json"):
-                    continue
-                sid = fn[:-5]
-                p = os.path.join(SESSIONS_DIR, fn)
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                except Exception:
-                    continue
-                if d.get("scanned") and sid not in active:
-                    try: os.remove(p)
-                    except OSError: pass
-        except OSError:
-            pass
+        remove_inactive_scanned_sessions(active)
         # ---- 2) archive 还原(兼容老数据) ----
         try:
             files = os.listdir(ARCHIVE_DIR)
@@ -2757,6 +3223,9 @@ def run_gui():
     menu.add_command(label="退出", command=root.destroy)
     cv.bind("<ButtonPress-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
 
+    # Scanned sessions have no SessionEnd hook. Reconcile them before the first
+    # render so a restart cannot resurrect a terminal that was closed.
+    restore_sessions()
     poll()
     root.mainloop()
 
