@@ -15,6 +15,9 @@ const { execFileSync } = require('child_process');
 //  2) WT 单进程多窗口:MainWindowHandle 只是其中一个窗口 → EnumWindows 枚举该 pid 全部
 //     可见顶层窗口,标题含项目名(name)者优先(TAPD-exec <项目名> 命中)。
 function getMeta(prevHwnd, prevPid, name) {
+    // ProjectManager 后台隐藏任务(CC_LIGHT_BG=1):无终端窗口,直接置 0 ——
+    // termpid 会误指到父进程(3001 后端 node)导致点击误聚焦它的宿主窗口
+    if (process.env.CC_LIGHT_BG === "1") return { hwnd: 0, termpid: 0 };
     try {
         const out = execFileSync('powershell',
             ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'hook_meta.ps1')],
@@ -39,6 +42,11 @@ const COLORS = { red: 1, yellow: 1, green: 1 };
 const rawAction = process.argv[2];
 const SOFT = rawAction === 'yellow_soft';   // PostToolUse 心跳:只刷 state/ts,跳过 getMeta 避免每个工具都起 powershell
 const action = SOFT ? 'yellow' : rawAction;
+
+// ProjectManager 后台隐藏任务(CC_LIGHT_BG=1):状态由后端代写(scanned 会话),
+// hook 一律让位 —— hook 写的非 scanned 版会覆盖后端版本、被 read_sessions 就地归档,
+// 造成「亮一两秒→灭→20s 心跳救回」的闪烁
+if (process.env.CC_LIGHT_BG === "1") process.exit(0);
 
 let raw = '';
 try { raw = fs.readFileSync(0, 'utf8'); } catch (e) {}
@@ -81,12 +89,14 @@ const name = base || String(sid).slice(0, 8);
 // 曾用 proj_name(含父目录)写 name,hook 接管若继承会固化这个污染值,而窗口标题只含 basename →
 // hwnd 失效后 _jump 兜底 find_window_by_name 匹配不到标题,跳不动。见 cc_light.py scan_active_jsonl。
 const now = Date.now() / 1000;
+// 后台任务(CC_LIGHT_BG=1):hwnd/termpid 强制 0(不用旧值——旧值误指父进程 3001 的宿主窗口)
+const BG = process.env.CC_LIGHT_BG === "1";
 
 // subagent start: subs+1, write yellow (a subagent running => the session is busy)
 if (action === 'sub_start') {
     const old = readSession(sid) || {};
     const meta = getMeta(old.hwnd, old.termpid, name);
-    writeSession(sid, { state: 'yellow', msg: '', ts: now, name: name, subs: (old.subs || 0) + 1, hwnd: meta.hwnd || old.hwnd || 0, termpid: meta.termpid || old.termpid || 0 });
+    writeSession(sid, { state: 'yellow', msg: '', ts: now, name: name, subs: (old.subs || 0) + 1, hwnd: BG ? 0 : (meta.hwnd || old.hwnd || 0), termpid: BG ? 0 : (meta.termpid || old.termpid || 0) });
     process.exit(0);
 }
 // subagent stop: subs-1, do NOT change state (the main agent may spawn another subagent)
@@ -116,6 +126,6 @@ writeSession(sid, {
     ts: now,
     name: name,
     subs: (old && old.subs) || 0,
-    hwnd: meta.hwnd || (old && old.hwnd) || 0,
-    termpid: meta.termpid || (old && old.termpid) || 0,
+    hwnd: BG ? 0 : (meta.hwnd || (old && old.hwnd) || 0),
+    termpid: BG ? 0 : (meta.termpid || (old && old.termpid) || 0),
 });

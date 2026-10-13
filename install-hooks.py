@@ -7,6 +7,8 @@ cc-light hooks 安装器 —— 把交通灯 hook 注入 ~/.claude/settings.json
   python install-hooks.py install     备份并注入 9 条 hook(幂等,可重复执行)
   python install-hooks.py uninstall   移除所有 cc-light hook
   python install-hooks.py status      查看注入情况
+  python install-hooks.py repair-stale-ecc  清理脚本已丢失的 ECC hook
+  python install-hooks.py repair-codex-hooks  清理 Codex 导入的失效 Claude hook
 
 为什么装用户级 settings.json,还靠灯窗口自愈?
   用户的 ~/.claude 被坚果云双向同步,settings.json 会被「另一台机器的配置」
@@ -37,6 +39,7 @@ except Exception:
 
 HOME = os.path.expanduser("~")
 SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+CODEX_HOOKS = os.path.join(HOME, ".codex", "hooks.json")
 DIR = os.path.dirname(os.path.abspath(__file__))
 MARKER = "cc-light/"
 
@@ -128,6 +131,85 @@ def count_cc_light(hooks):
             detail[evt] = c
             n += c
     return n, detail
+
+
+def ecc_runner_exists():
+    """Check the locations supported by the installed ECC hook wrappers."""
+    rel = os.path.join("scripts", "hooks", "run-with-flags.js")
+    claude_dir = os.path.join(HOME, ".claude")
+    roots = [os.environ.get("CLAUDE_PLUGIN_ROOT", ""), claude_dir]
+    roots += [os.path.join(claude_dir, *parts) for parts in (
+        ("plugins", "ecc"), ("plugins", "ecc@ecc"),
+        ("plugins", "marketplace", "ecc"),
+        ("plugins", "everything-claude-code"),
+        ("plugins", "everything-claude-code@everything-claude-code"),
+        ("plugins", "marketplace", "everything-claude-code"),
+    )]
+    for slug in ("ecc", "everything-claude-code"):
+        cache = os.path.join(claude_dir, "plugins", "cache", slug)
+        try:
+            for org in os.scandir(cache):
+                if org.is_dir():
+                    for version in os.scandir(org.path):
+                        if version.is_dir():
+                            roots.append(version.path)
+        except OSError:
+            pass
+    return any(root and os.path.isfile(os.path.join(root, rel)) for root in roots)
+
+
+def strip_stale_ecc(hooks):
+    """Remove only ECC wrapper commands whose runner is no longer installed."""
+    if ecc_runner_exists():
+        return 0
+    removed = 0
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                kept.append(entry)
+                continue
+            commands = entry["hooks"]
+            live = [hook for hook in commands if not (
+                isinstance(hook, dict) and
+                "run-with-flags.js" in hook.get("command", "")
+            )]
+            removed += len(commands) - len(live)
+            if live:
+                kept.append({**entry, "hooks": live})
+        hooks[event] = kept
+    return removed
+
+
+def strip_incompatible_codex_hooks(hooks):
+    """Remove imported Claude commands that cannot run correctly in Codex."""
+    removed = 0
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                kept.append(entry)
+                continue
+            commands = entry["hooks"]
+            live = []
+            for hook in commands:
+                command = hook.get("command", "") if isinstance(hook, dict) else ""
+                if isinstance(command, str) and (
+                    "/home/ubuntu/.claude/" in command or
+                    "run-with-flags.js" in command or
+                    "/.claude/cc-light/hook.js" in command
+                ):
+                    removed += 1
+                else:
+                    live.append(hook)
+            if live:
+                kept.append({**entry, "hooks": live})
+        hooks[event] = kept
+    return removed
 
 
 def inject_into(data):
@@ -225,11 +307,84 @@ def cmd_status():
     return 0
 
 
+def cmd_repair_stale_ecc():
+    if not os.path.exists(SETTINGS):
+        sys.stderr.write("[!] 找不到 %s\n" % SETTINGS)
+        return 1
+    try:
+        with open(SETTINGS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.stderr.write("[!] 无法读取 settings.json: %s\n" % e)
+        return 1
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        print("[--] 没有 hook 配置")
+        return 0
+    removed = strip_stale_ecc(hooks)
+    if not removed:
+        print("[--] 没有失效的 ECC hook")
+        return 0
+    bak = backup(SETTINGS)
+    if not bak:
+        sys.stderr.write("[!] 备份 settings.json 失败,未写入\n")
+        return 1
+    tmp = SETTINGS + ".tmp-cc-light"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, SETTINGS)
+    except OSError as e:
+        sys.stderr.write("[!] 写入 settings.json 失败: %s\n" % e)
+        return 1
+    print("[OK] 已清理 %d 条失效的 ECC hook;备份: %s" % (removed, bak))
+    return 0
+
+
+def cmd_repair_codex_hooks():
+    if not os.path.exists(CODEX_HOOKS):
+        sys.stderr.write("[!] 找不到 %s\n" % CODEX_HOOKS)
+        return 1
+    try:
+        with open(CODEX_HOOKS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.stderr.write("[!] 无法读取 Codex hooks.json: %s\n" % e)
+        return 1
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        print("[--] Codex 没有 hook 配置")
+        return 0
+    removed = strip_incompatible_codex_hooks(hooks)
+    if not removed:
+        print("[--] Codex 没有失效的导入 hook")
+        return 0
+    bak = backup(CODEX_HOOKS)
+    if not bak:
+        sys.stderr.write("[!] 备份 Codex hooks.json 失败,未写入\n")
+        return 1
+    tmp = CODEX_HOOKS + ".tmp-cc-light"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, CODEX_HOOKS)
+    except OSError as e:
+        sys.stderr.write("[!] 写入 Codex hooks.json 失败: %s\n" % e)
+        return 1
+    print("[OK] 已清理 %d 条 Codex 导入的失效 hook;备份: %s" % (removed, bak))
+    return 0
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("install", "uninstall", "status"):
-        sys.stderr.write("usage: install-hooks.py install|uninstall|status\n")
+    if len(sys.argv) < 2 or sys.argv[1] not in (
+            "install", "uninstall", "status", "repair-stale-ecc", "repair-codex-hooks"):
+        sys.stderr.write("usage: install-hooks.py install|uninstall|status|repair-stale-ecc|repair-codex-hooks\n")
         return 2
-    return {"install": cmd_install, "uninstall": cmd_uninstall, "status": cmd_status}[sys.argv[1]]()
+    return {"install": cmd_install, "uninstall": cmd_uninstall,
+            "status": cmd_status, "repair-stale-ecc": cmd_repair_stale_ecc,
+            "repair-codex-hooks": cmd_repair_codex_hooks}[sys.argv[1]]()
 
 
 if __name__ == "__main__":

@@ -51,6 +51,57 @@ def test_trae_focus_uri_invalid_pid():
     assert L.trae_focus_uri(None) is None
 
 
+def test_codex_jump_focuses_trae_terminal():
+    uri = "trae-cn://cc-light.cc-light-helper/focus?pid=123&pid=456"
+    with patch.object(L, "find_trae_window", return_value=789), \
+         patch.object(L, "find_window_by_pid") as by_pid, \
+         patch.object(L, "find_window_by_name") as by_name, \
+         patch.object(L, "focus_window", return_value=True) as focus, \
+         patch.object(L, "_is_trae_wnd", return_value=True), \
+         patch.object(L, "trae_focus_uri", return_value=uri), \
+         patch.object(L.os, "startfile", create=True) as startfile:
+        assert L.jump_codex_session(123, "project") is True
+        focus.assert_called_once_with(789)
+        startfile.assert_called_once_with(uri)
+        by_pid.assert_not_called()
+
+
+def test_codex_jump_falls_back_to_project_window():
+    with patch.object(L, "find_trae_window", return_value=None), \
+         patch.object(L, "find_window_by_pid", return_value=None), \
+         patch.object(L, "find_window_by_name", return_value=789) as by_name, \
+         patch.object(L, "focus_window", return_value=True) as focus, \
+         patch.object(L, "_is_trae_wnd", return_value=False), \
+         patch.object(L.os, "startfile", create=True) as startfile:
+        assert L.jump_codex_session(123, "project") is True
+        by_name.assert_called_once_with("project")
+        focus.assert_called_once_with(789)
+        startfile.assert_not_called()
+
+
+def test_codex_jump_uses_trae_uri_after_name_fallback():
+    uri = "trae-cn://cc-light.cc-light-helper/focus?pid=123"
+    with patch.object(L, "find_trae_window", return_value=789), \
+         patch.object(L, "find_window_by_pid") as by_pid, \
+         patch.object(L, "find_window_by_name", return_value=789), \
+         patch.object(L, "focus_window", return_value=True), \
+         patch.object(L, "_is_trae_wnd", return_value=True), \
+         patch.object(L, "trae_focus_uri", return_value=uri), \
+         patch.object(L.os, "startfile", create=True) as startfile:
+        assert L.jump_codex_session(123, "project") is True
+        startfile.assert_called_once_with(uri)
+        by_pid.assert_not_called()
+
+
+def test_find_trae_window_falls_back_without_project_title():
+    with patch.object(L, "find_window_by_name", side_effect=[None, 456]) as by_name:
+        assert L.find_trae_window("project") == 456
+        assert by_name.call_args_list[0].args == ("project",)
+        assert by_name.call_args_list[0].kwargs == {"process_keyword": "trae"}
+        assert by_name.call_args_list[1].args == (None,)
+        assert by_name.call_args_list[1].kwargs == {"process_keyword": "trae"}
+
+
 def test_get_session_title_invalid():
     # 不存在的 sid / jsonl → 空串,不抛
     assert L.get_session_title("nonexistent-sid-zzz") == ""
