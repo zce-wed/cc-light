@@ -3,7 +3,7 @@
 Windows API 依赖运行环境,这里只测纯逻辑分支(空值/死 pid 不崩 + 合理返回);
 端到端用 `python cc_light.py --diag` 验证当前所有会话能定位窗口。"""
 import sys, os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import cc_light as L
 
@@ -17,6 +17,32 @@ def test_find_window_by_name_empty():
 def test_find_window_by_pid_invalid():
     assert L.find_window_by_pid(0) is None
     assert L.find_window_by_pid(None) is None
+
+
+def test_find_window_by_pid_chooses_nearest_host_not_first_window():
+    if sys.platform != "win32":
+        return
+    import ctypes
+    api = MagicMock()
+    api.IsWindowVisible.return_value = True
+    api.GetParent.return_value = 0
+    window_pids = {10: 300, 20: 200, 30: 999}
+
+    def window_pid(hwnd, ptr):
+        ptr._obj.value = window_pids[hwnd]
+        return 1
+
+    def enum_windows(callback, arg):
+        for hwnd in (10, 20, 30):
+            if not callback(hwnd, arg):
+                break
+        return True
+
+    api.GetWindowThreadProcessId.side_effect = window_pid
+    api.EnumWindows.side_effect = enum_windows
+    with patch.object(L, "_ancestor_pids", return_value=[100, 200, 300]), \
+         patch.object(ctypes, "windll", MagicMock(user32=api)):
+        assert L.find_window_by_pid(100) == 20
 
 
 def test_ancestor_pids_invalid_no_crash():
@@ -51,46 +77,102 @@ def test_trae_focus_uri_invalid_pid():
     assert L.trae_focus_uri(None) is None
 
 
-def test_codex_jump_focuses_trae_terminal():
+def test_focus_trae_terminal_does_not_require_shared_hwnd():
     uri = "trae-cn://cc-light.cc-light-helper/focus?pid=123&pid=456"
-    with patch.object(L, "find_trae_window", return_value=789), \
-         patch.object(L, "find_window_by_pid") as by_pid, \
-         patch.object(L, "find_window_by_name") as by_name, \
-         patch.object(L, "focus_window", return_value=True) as focus, \
-         patch.object(L, "_is_trae_wnd", return_value=True), \
+    with patch.object(L, "_is_trae_wnd", return_value=True), \
          patch.object(L, "trae_focus_uri", return_value=uri), \
          patch.object(L.os, "startfile", create=True) as startfile:
-        assert L.jump_codex_session(123, "project") is True
-        focus.assert_called_once_with(789)
+        assert L.focus_trae_terminal(789, 123) is True
         startfile.assert_called_once_with(uri)
-        by_pid.assert_not_called()
 
 
-def test_codex_jump_falls_back_to_project_window():
-    with patch.object(L, "find_trae_window", return_value=None), \
-         patch.object(L, "find_window_by_pid", return_value=None), \
-         patch.object(L, "find_window_by_name", return_value=789) as by_name, \
-         patch.object(L, "focus_window", return_value=True) as focus, \
-         patch.object(L, "_is_trae_wnd", return_value=False), \
+def test_focus_trae_terminal_rejects_non_trae_window():
+    with patch.object(L, "_is_trae_wnd", return_value=False), \
          patch.object(L.os, "startfile", create=True) as startfile:
-        assert L.jump_codex_session(123, "project") is True
-        by_name.assert_called_once_with("project")
-        focus.assert_called_once_with(789)
+        assert L.focus_trae_terminal(789, 123) is False
         startfile.assert_not_called()
 
 
-def test_codex_jump_uses_trae_uri_after_name_fallback():
-    uri = "trae-cn://cc-light.cc-light-helper/focus?pid=123"
-    with patch.object(L, "find_trae_window", return_value=789), \
-         patch.object(L, "find_window_by_pid") as by_pid, \
-         patch.object(L, "find_window_by_name", return_value=789), \
-         patch.object(L, "focus_window", return_value=True), \
+def test_codex_jump_focuses_trae_terminal():
+    uri = "trae-cn://cc-light.cc-light-helper/focus?pid=123&pid=456"
+    with patch.object(L, "find_trae_window", return_value=789) as by_name, \
+         patch.object(L, "find_window_by_pid", return_value=789) as by_pid, \
+         patch.object(L, "find_window_by_name") as window_by_name, \
+         patch.object(L, "_codex_process_context", return_value={}), \
+         patch.object(L, "_window_process_name", return_value="Trae CN.exe"), \
+         patch.object(L, "focus_window", return_value=True) as focus, \
          patch.object(L, "_is_trae_wnd", return_value=True), \
          patch.object(L, "trae_focus_uri", return_value=uri), \
          patch.object(L.os, "startfile", create=True) as startfile:
         assert L.jump_codex_session(123, "project") is True
+        focus.assert_called_once_with(789)
         startfile.assert_called_once_with(uri)
-        by_pid.assert_not_called()
+        by_pid.assert_called_once_with(123)
+        by_name.assert_not_called()
+        window_by_name.assert_not_called()
+
+
+def test_codex_jump_does_not_guess_another_project_window():
+    with patch.object(L, "_codex_process_context", return_value={}), \
+         patch.object(L, "find_trae_window", return_value=999) as trae, \
+         patch.object(L, "find_window_by_pid", return_value=None), \
+         patch.object(L, "find_window_by_name", return_value=789) as by_name, \
+         patch.object(L, "focus_window", return_value=True) as focus, \
+         patch.object(L.os, "startfile", create=True) as startfile:
+        assert L.jump_codex_session(123, "project") is False
+        by_name.assert_not_called()
+        trae.assert_not_called()
+        focus.assert_not_called()
+        startfile.assert_not_called()
+
+
+def test_codex_jump_keeps_windows_terminal_host():
+    with patch.object(L, "_codex_process_context", return_value={}), \
+         patch.object(L, "find_window_by_pid", return_value=456), \
+         patch.object(L, "find_trae_window", return_value=789) as trae, \
+         patch.object(L, "_window_process_name", return_value="WindowsTerminal.exe"), \
+         patch.object(L, "_is_trae_wnd", return_value=False), \
+         patch.object(L, "focus_window", return_value=True) as focus, \
+         patch.object(L.os, "startfile", create=True) as startfile:
+        assert L.jump_codex_session(123, "project") is True
+        focus.assert_called_once_with(456)
+        trae.assert_not_called()
+        startfile.assert_not_called()
+
+
+def test_codex_jump_rejects_shared_daemon():
+    with patch.object(L, "find_window_by_pid", return_value=None) as by_pid, \
+         patch.object(L.os, "startfile", create=True) as startfile:
+        assert L.jump_codex_session(123, "project") is False
+        by_pid.assert_called_once_with(123)
+        startfile.assert_not_called()
+
+
+def test_codex_jump_never_focuses_desktop_codex():
+    with patch.object(L, "_codex_process_context", return_value={}), \
+         patch.object(L, "find_window_by_pid", return_value=789), \
+         patch.object(L, "_window_process_name", return_value="Codex.exe"), \
+         patch.object(L, "focus_window") as focus, \
+         patch.object(L.os, "startfile", create=True) as startfile:
+        assert L.jump_codex_session(123, "project") is False
+        focus.assert_not_called()
+        startfile.assert_not_called()
+
+
+def test_resolve_session_hwnd_prefers_live_terminal_process():
+    with patch.object(L, "find_window_by_pid", return_value=456) as by_pid, \
+         patch.object(L, "resolve_hwnd", return_value=123) as by_hwnd:
+        assert L.resolve_session_hwnd(123, 999, "project") == 456
+        by_pid.assert_called_once_with(999)
+        by_hwnd.assert_not_called()
+
+
+def test_resolve_session_hwnd_falls_back_to_recorded_window():
+    with patch.object(L, "find_window_by_pid", return_value=None) as by_pid, \
+         patch.object(L, "resolve_hwnd", return_value=123) as by_hwnd:
+        assert L.resolve_session_hwnd(123, 999, "project") == 123
+        by_pid.assert_called_once_with(999)
+        by_hwnd.assert_called_once_with(123, "project")
 
 
 def test_find_trae_window_falls_back_without_project_title():

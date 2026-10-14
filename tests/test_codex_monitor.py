@@ -68,7 +68,7 @@ def test_resumed_daemon_threads_use_live_ownership():
             os.utime(path, (now - 86400, now - 86400))
         processes = {100: now - 3600, 200: now - 600, 300: now - 30}
         contexts = {100: {"command": "codex.exe app-server --managed-daemon"},
-                    200: {"cwd": cwd}, 300: {"cwd": cwd}}
+                    200: {"cwd": cwd}, 300: {"cwd": cwd, "command": "codex.exe resume " + sid}}
         with patch.object(light, "CODEX_SESSIONS_DIR", folder), \
              patch.object(light, "_codex_process_starts", return_value=processes), \
              patch.object(light, "_codex_process_context", side_effect=contexts.get), \
@@ -81,6 +81,31 @@ def test_resumed_daemon_threads_use_live_ownership():
             assert sessions[sid]["termpid"] == 300
             owners.return_value = {}
             assert light.scan_codex_sessions(now + 4) == {}
+
+
+def test_shared_daemon_uses_lock_time_to_choose_terminal():
+    sid = "11111111-1111-1111-1111-111111111111"
+    cwd = os.path.normcase(os.path.normpath("C:/work/sample-project"))
+    processes = {100: 1, 200: 2, 300: 3}
+    contexts = {100: {"command": "codex.exe app-server"},
+                200: {"cwd": cwd}, 300: {"cwd": cwd}}
+    assert light._codex_terminal_pid(sid, {"pid": 100, "ts": 2.1}, cwd,
+                                     processes, contexts) == 200
+    contexts[200]["command"] = 'codex.exe resume "' + sid + '"'
+    assert light._codex_terminal_pid(sid, {"pid": 100, "ts": 3}, cwd,
+                                     processes, contexts) == 200
+
+
+def test_background_daemon_without_terminal_has_no_jump_pid():
+    assert light._codex_terminal_pid("thread", {"pid": 100}, "C:/work",
+        {100: 1}, {100: {"command": "codex.exe app-server"}}) == 0
+
+
+def test_missing_cwd_falls_back_to_live_cli_client():
+    sid = "11111111-1111-1111-1111-111111111111"
+    assert light._codex_terminal_pid(sid, {"pid": 100, "ts": 2.1}, "C:/work",
+        {100: 1, 200: 2, 300: 3},
+        {100: {"command": "codex.exe app-server"}, 200: {}, 300: {}}) == 200
 
 
 def test_unowned_rollouts_do_not_match_background_daemon():
@@ -144,6 +169,9 @@ def test_windows_lock_ownership_ignores_closed_handles():
 if __name__ == "__main__":
     test_codex_turns_and_process_lifetime()
     test_resumed_daemon_threads_use_live_ownership()
+    test_shared_daemon_uses_lock_time_to_choose_terminal()
+    test_background_daemon_without_terminal_has_no_jump_pid()
+    test_missing_cwd_falls_back_to_live_cli_client()
     test_unowned_rollouts_do_not_match_background_daemon()
     test_archived_codex_rollout_is_hidden_without_deleting_log()
     test_windows_lock_ownership_ignores_closed_handles()

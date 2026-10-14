@@ -728,6 +728,34 @@ def _codex_log_state(path, cache):
     return cache.get("meta")
 
 
+def _codex_terminal_pid(sid, owner, cwd, processes, contexts):
+    """Resolve a writer to the most likely live Codex CLI client."""
+    clients = [pid for pid in processes
+               if "app-server" not in contexts[pid].get("command", "")]
+    explicit = [pid for pid in clients
+                if sid in [arg.strip('\"\'') for arg in
+                           contexts[pid].get("command", "").split()]]
+    if len(explicit) == 1:
+        return explicit[0]
+    if len(explicit) > 1:
+        return 0
+    pid = owner["pid"]
+    if pid in clients:
+        return pid
+    candidates = [client for client in clients if
+                  contexts[client].get("cwd") == os.path.normcase(os.path.normpath(cwd))]
+    if not candidates:
+        # Querying a protected Codex process can hide its cwd. Keep the
+        # session usable by choosing the client whose lifetime is closest to
+        # the lock owner; this is still better than dropping the terminal id.
+        candidates = clients
+    if not candidates:
+        return 0
+    # Lock mtime is updated by the active writer. It is the only signal that
+    # separates several Codex terminals opened in the same working directory.
+    return min(candidates, key=lambda p: abs(owner.get("ts", 0) - processes[p]))
+
+
 def scan_codex_sessions(now=None):
     """Collect Codex rollouts owned by a currently running codex.exe."""
     now = time.time() if now is None else now
@@ -735,6 +763,7 @@ def scan_codex_sessions(now=None):
         return _CODEX_CACHE["sessions"]
     processes = _codex_process_starts()
     result = {}
+    bindings = _CODEX_CACHE.setdefault("bindings", {})
     archived = _read_codex_archived()
     if processes:
         owners = _codex_session_owners(processes)
@@ -777,12 +806,15 @@ def scan_codex_sessions(now=None):
                         owner = owners.get(sid)
                         if not owner:
                             continue
-                        pid = owner["pid"]
-                        if "app-server" in contexts[pid].get("command", ""):
-                            candidates = [client for client in clients if
-                                contexts[client].get("cwd") == os.path.normcase(os.path.normpath(cwd))]
-                            if candidates:
-                                pid = min(candidates, key=lambda p: abs(owner["ts"] - clients[p]))
+                        bound = bindings.get(sid)
+                        if isinstance(bound, (tuple, list)):
+                            pid, bound_created = bound
+                        else:
+                            pid, bound_created = bound, None
+                        if (pid not in processes or
+                                bound_created is not None and processes[pid] != bound_created or
+                                "app-server" in contexts.get(pid, {}).get("command", "")):
+                            pid = _codex_terminal_pid(sid, owner, cwd, processes, contexts)
                     else:
                         try:
                             started = datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00")).timestamp()
@@ -797,6 +829,11 @@ def scan_codex_sessions(now=None):
                     result[sid] = {"provider": "codex", "state": entry.get("state", "green"),
                                    "ts": mtime, "name": name, "termpid": pid,
                                    "jsonl": path, "hwnd": 0, "subs": 0}
+                    if pid:
+                        bindings[sid] = (pid, processes.get(pid))
+    for sid in list(bindings):
+        if sid not in result:
+            bindings.pop(sid, None)
     _CODEX_CACHE.update(checked=now, sessions=result)
     return result
 
@@ -1454,14 +1491,29 @@ def trae_focus_uri(pid):
     return "trae-cn://cc-light.cc-light-helper/focus?" + "&".join("pid=" + str(p) for p in pids)
 
 
+def focus_trae_terminal(hwnd, termpid):
+    """Select a session's terminal in Trae after focusing its host window."""
+    if not hwnd or not termpid or not _is_trae_wnd(hwnd):
+        return False
+    try:
+        uri = trae_focus_uri(termpid)
+        if uri:
+            os.startfile(uri)
+            return True
+    except Exception as exc:
+        log_error(exc, "Trae 终端会话切换失败")
+    return False
+
+
 def find_window_by_pid(pid):
     """按进程 PID 沿【父链】找一个可见顶层窗口。termpid 是 powershell(无窗口),真正的终端/
     编辑器窗口在祖父(WindowsTerminal/Trae 主进程),所以收集 termpid 及其祖先 pid,一次
-    EnumWindows 命中其中任一拥有的可见顶层窗口即返回。scanned 会话 hwnd 失效/为 0 时,
+    EnumWindows 选父链中最近进程拥有的可见顶层窗口。scanned 会话 hwnd 失效/为 0 时,
     _jump 用它兜底定位 WT/Trae 宿主窗口 focus(只查 termpid 本身永远 None —— powershell 无窗)。"""
-    pids = set(_ancestor_pids(pid))
+    pids = _ancestor_pids(pid)
     if not pids:
         return None
+    ranks = {p: rank for rank, p in enumerate(pids)}
     try:
         import ctypes
         from ctypes import wintypes
@@ -1472,16 +1524,18 @@ def find_window_by_pid(pid):
         u.GetWindowThreadProcessId.restype = wintypes.DWORD
         ENUMWNDPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         u.EnumWindows.argtypes = [ENUMWNDPROC, wintypes.LPARAM]; u.EnumWindows.restype = wintypes.BOOL
-        found = [None]
+        found = [None, len(pids)]
 
         def _cb(hwnd, _lp):
             if not u.IsWindowVisible(hwnd) or u.GetParent(hwnd):
                 return True
             v = wintypes.DWORD()
             u.GetWindowThreadProcessId(hwnd, ctypes.byref(v))
-            if v.value in pids:
-                found[0] = hwnd
-                return False                    # 找到即停
+            rank = ranks.get(v.value, len(pids))
+            if rank < found[1]:
+                found[:] = [hwnd, rank]
+                if rank == 0:
+                    return False
             return True
 
         u.EnumWindows(ENUMWNDPROC(_cb), 0)
@@ -1571,35 +1625,21 @@ def _is_trae_wnd(hwnd):
 
 
 def jump_codex_session(pid, name):
-    """Focus the matching Trae workbench and select its terminal."""
-    # Codex is often launched by a Windows Terminal process. That parent window
-    # is alive, but it is not the Trae workbench the user expects to return to.
-    target = find_trae_window(name) if name else None
-    if target:
-        focused = focus_window(target)
-        try:
-            uri = trae_focus_uri(pid)
-            if uri:
-                os.startfile(uri)
-                return bool(focused)
-        except Exception as exc:
-            log_error(exc, "Codex Trae 终端跳转失败")
-        return bool(focused)
+    """Focus the existing terminal that owns this session's CLI process.
 
-    target = find_window_by_pid(pid) if pid else None
-    if not target:
-        target = find_window_by_name(name)
+    Project names and shared app-server processes do not identify a terminal.
+    Only send the Trae terminal selector when the resolved host is Trae.
+    """
+    if not pid:
+        return False
+    target = find_window_by_pid(pid)
     if not target:
         return False
+    if _window_process_name(target).lower() == "codex.exe":
+        return False
     focused = focus_window(target)
-    if pid and _is_trae_wnd(target):
-        try:
-            uri = trae_focus_uri(pid)
-            if uri:
-                os.startfile(uri)
-                return bool(focused)
-        except Exception as exc:
-            log_error(exc, "Codex Trae 终端跳转失败")
+    if _is_trae_wnd(target):
+        return bool(focused and focus_trae_terminal(target, pid))
     return bool(focused)
 
 
@@ -1613,6 +1653,19 @@ def resolve_hwnd(hwnd, name):
     except Exception:
         pass
     return find_window_by_name(name)
+
+
+def resolve_session_hwnd(hwnd, termpid, name):
+    """Resolve a session's host window, preferring its live process ancestry.
+
+    A stored HWND identifies only the host window. Multiple terminal sessions
+    can share that HWND, so a live terminal PID is the more specific locator.
+    """
+    if termpid:
+        target = find_window_by_pid(termpid)
+        if target:
+            return target
+    return resolve_hwnd(hwnd, name)
 
 
 def is_process_alive(pid):
@@ -1975,9 +2028,7 @@ def run_gui():
                 # 按父链会误中后端宿主窗口;直接走焦点文件+打开管理页
                 tgt = None
                 if not _sc:
-                    tgt = resolve_hwnd(_h, _nm)
-                    if not tgt and _t:
-                        tgt = find_window_by_pid(_t)
+                    tgt = resolve_session_hwnd(_h, _t, _nm)
                 if tgt:
                     if not focus_window(tgt):
                         log_error(None, "跳转 focus 失败(前台锁定?): sid=%s name=%r hwnd=%s tgt=%s"
@@ -1999,13 +2050,10 @@ def run_gui():
                         webbrowser.open("http://192.168.1.165:3667/#/work/tapd")
                     except Exception:
                         pass
-                if _t and _sh and _is_trae_wnd(tgt):
-                    try:
-                        uri = trae_focus_uri(_t)
-                        if uri:
-                            os.startfile(uri)
-                    except Exception:
-                        pass
+                # The hwnd may be missing or recorded differently for each
+                # session even when Trae hosts them in one workbench. The PID
+                # chain is the source of truth for selecting the terminal.
+                focus_trae_terminal(tgt, _t)
                 break
             close_details()
 
@@ -2189,6 +2237,8 @@ def run_gui():
         render_dots(sessions, time.time())
 
     def restore_sessions():
+        _CODEX_CACHE["checked"] = 0
+        scan_codex_sessions(time.time())
         """「检测所有会话」:
         扫 ~/.claude/projects 下 SCAN_ACTIVE 内的 jsonl,只保留【有 claude.exe 进程在跑】
         的项目(scan_active_jsonl 按进程 cwd 判活 —— 已关的不会误补),补建 sessions 里缺失的
