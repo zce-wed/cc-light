@@ -1054,6 +1054,11 @@ def scan_dsh_sessions(now=None):
     the current app run are listed -- otherwise checkpoints left by a previous
     run would keep ghost sessions visible after the app was closed.  Idle
     sessions fade out after ``DSH_ACTIVE_WINDOW``; busy ones never do.
+
+    Archived sessions (cc-light's right-click delete or the app's sidebar
+    archive) stay hidden only while idle.  Once such a session starts another
+    turn it comes back -- otherwise a still-running archived session would
+    silently stop the light from reporting its state.
     """
     now = time.time() if now is None else now
     if now - _DSH_CACHE["checked"] < DSH_SCAN_INTERVAL:
@@ -1071,8 +1076,6 @@ def scan_dsh_sessions(now=None):
             if not fn.endswith(".json"):
                 continue
             sid = fn[:-5]
-            if sid in archived:
-                continue
             path = os.path.join(DSH_PROJ_CACHE_DIR, fn)
             try:
                 mtime = os.path.getmtime(path)
@@ -1090,6 +1093,8 @@ def scan_dsh_sessions(now=None):
             if meta.get("blank", True) or not meta.get("lastPromptAt"):
                 continue                    # 从未发过消息的空会话
             state = _dsh_state(rows)
+            if sid in archived and state == "green":
+                continue                    # 归档/删除只隐藏空闲会话(重新运行时必须能被看见)
             if state == "green" and now - mtime > DSH_ACTIVE_WINDOW:
                 continue                    # 空闲会话放久后隐藏;运行中/等回答不受限
             identity = record.get("identity") or {}

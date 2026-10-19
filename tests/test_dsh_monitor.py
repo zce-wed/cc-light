@@ -112,6 +112,20 @@ def test_scan_lists_busy_and_recent_idle_sessions():
         assert busy.exists()
 
 
+def test_scan_shows_archived_session_again_when_busy():
+    # 归档/删除的会话只是从列表隐藏空闲态;它重新跑起来(yellow)必须回到灯里,
+    # 否则「正在运行」的状态会被归档静默吞掉。
+    now = time.time()
+    with tempfile.TemporaryDirectory() as folder:
+        cache = Path(folder)
+        _write(cache, "session-archived-busy",
+               _record("session-archived-busy", "C:/w/a", open_turn=3,
+                       last_prompt_at=1))
+        result = _scan(cache, now, archived={"session-archived-busy"})
+        assert set(result) == {"session-archived-busy"}
+        assert result["session-archived-busy"]["state"] == "yellow"
+
+
 def test_scan_skips_blank_archived_stale_and_dead_app():
     now = time.time()
     with tempfile.TemporaryDirectory() as folder:
