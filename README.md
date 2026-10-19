@@ -1,8 +1,10 @@
-# cc-light — Claude Code / Codex 桌面悬浮交通灯
+# cc-light — Claude Code / Codex / DeepSeek Harness 桌面悬浮交通灯
 
-一个悬浮在桌面最顶层的小交通灯,实时反映 Claude Code 和 Codex 会话的复合状态。多窗口按优先级聚合(任一红 > 任一黄 > 任一绿 > 灰),一眼知道「现在最该去哪个窗口」;灯下方一排小点展示每个窗口的状态。
+一个悬浮在桌面最顶层的小交通灯,实时反映 Claude Code、Codex 和 DeepSeek Harness 会话的复合状态。多窗口按优先级聚合(任一红 > 任一黄 > 任一绿 > 灰),一眼知道「现在最该去哪个窗口」;灯下方一排小点展示每个窗口的状态。
 
 Codex 无需安装 hook:灯窗口每 3 秒读取 `~/.codex/sessions` 的回合事件,通过 `thread-writer-locks` 文件的实际持有进程识别活跃会话,支持继续旧会话和共享后台服务。`task_started` 显示黄灯,`task_complete` / `turn_aborted` 显示绿灯;会话锁释放后从灯中移除,历史遗留锁文件不会被当成活跃会话。旧版 Codex 没有会话锁时按终端进程启动时间匹配。明细中以 `Codex · 项目名` 区分来源。Codex 的权限等待目前没有可靠的本地事件,因此不会触发红灯。
+
+DeepSeek Harness 同样无需 hook:灯窗口每 2 秒读取桌面版实时写入的投影缓存 `~/.dsh/storages/session_projcache/sessions/<id>.json`,turn/step 未结束显示黄灯,空闲显示绿灯,`ask_user_question` 等待回答显示红灯。只展示本次应用启动后动过的会话,应用退出后自动消失;空闲会话 1 小时无更新后隐去,运行中的会话不受此限。明细中以 `DeepSeek · 项目名` 区分来源。权限审批只推送到渲染进程(落盘的 `approval/asked` 在压缩会话日志里),因此等待审批时仍显示黄灯,不触发红灯。点击聚焦 DeepSeek Harness 窗口;它是单实例桌面应用,无法从外部切换具体会话 tab。
 
 纯 Python(tkinter 灯窗口)+ Node.js(hook),零第三方依赖。
 
@@ -16,6 +18,8 @@ Codex 无需安装 hook:灯窗口每 3 秒读取 `~/.codex/sessions` 的回合�
 | ⚫ 全暗 | 无活跃会话 | — |
 
 > 用户中断不触发 `Stop`(CC 官方设计),靠 `Notification(idle_prompt)` 兜底变绿,再加超时降级双保险。
+>
+> 表中的「触发事件」只适用于 Claude Code。Codex 按 `task_started` / `task_complete` 等回合事件判色;DeepSeek Harness 按投影缓存里的 `turnBoundary` / `sessionStats.openStep` 判黄、`userQuestions.active` 判红。
 
 ## 多会话聚合
 

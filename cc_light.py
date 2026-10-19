@@ -41,6 +41,17 @@ CODEX_SCAN_INTERVAL = 3
 CODEX_ARCHIVED_FILE = os.path.join(DATA_DIR, "codex-archived.json")
 _CODEX_CACHE = {"checked": 0, "sessions": {}, "logs": {}}
 _CODEX_TITLES = {"mtime": None, "titles": {}}
+# DeepSeek Harness 桌面版:会话事件实时折叠进 projection cache(每会话一个 JSON),
+# 不需要 hook,也不需要解压 session.v4.jsonl.zstd。
+DSH_PROJ_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".dsh",
+                                  "storages", "session_projcache", "sessions")
+DSH_WORKSPACE_FILE = os.path.join(os.path.expanduser("~"), ".dsh",
+                                  "storages", "workspace.json")
+DSH_IMAGE = "deepseek harness.exe"
+DSH_SCAN_INTERVAL = 2
+DSH_ACTIVE_WINDOW = 3600    # 空闲会话 1h 未更新后不再展示(忙碌中的会话不受限)
+DSH_ARCHIVED_FILE = os.path.join(DATA_DIR, "dsh-archived.json")
+_DSH_CACHE = {"checked": 0, "sessions": {}}
 DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
 ERROR_LOG = os.path.join(DATA_DIR, "error.log")          # 异常日志(右键「错误日志」查看,复制丢给排查)
 MAX_ERROR_LOG = 200   # 异常日志保留最近 N 条(超 500KB 自动截断)
@@ -463,31 +474,31 @@ def archive_session(sid):
         pass
 
 
-def _read_codex_archived():
-    """Return Codex sessions hidden from the cc-light list by the user."""
+def _read_archived_ids(path):
+    """Read a list of session ids hidden by the user for a scanned provider."""
     try:
-        with open(CODEX_ARCHIVED_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             value = json.load(f)
         return {sid for sid in value if isinstance(sid, str)} if isinstance(value, list) else set()
     except (OSError, ValueError, TypeError):
         return set()
 
 
-def archive_codex_session(sid):
-    """Hide a dynamically scanned Codex session without touching its rollout log."""
-    archived = _read_codex_archived()
+def _archive_scanned_session(path, sid):
+    """Hide one dynamically scanned session without touching its own log."""
+    archived = _read_archived_ids(path)
     archived.add(sid)
     try:
         ensure_dir()
-        tmp = CODEX_ARCHIVED_FILE + ".tmp"
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(sorted(archived), f)
         try:
-            os.replace(tmp, CODEX_ARCHIVED_FILE)
+            os.replace(tmp, path)
         except OSError:
             # Some managed Windows folders deny rename-on-close; preserve the
             # marker with the same direct-write fallback used by other settings.
-            with open(CODEX_ARCHIVED_FILE, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(sorted(archived), f)
             try:
                 os.remove(tmp)
@@ -495,6 +506,39 @@ def archive_codex_session(sid):
                 pass
     except OSError:
         pass
+
+
+def _read_codex_archived():
+    """Return Codex sessions hidden from the cc-light list by the user."""
+    return _read_archived_ids(CODEX_ARCHIVED_FILE)
+
+
+def archive_codex_session(sid):
+    """Hide a dynamically scanned Codex session without touching its rollout log."""
+    _archive_scanned_session(CODEX_ARCHIVED_FILE, sid)
+
+
+def _read_dsh_archived():
+    """Sessions hidden by the user: cc-light's own list plus the app's archive.
+
+    The desktop app records archived sessions in ``workspace.json``; those are
+    no longer shown in its sidebar, so they must not appear in the light either.
+    """
+    archived = _read_archived_ids(DSH_ARCHIVED_FILE)
+    try:
+        with open(DSH_WORKSPACE_FILE, "r", encoding="utf-8") as f:
+            workspace = json.load(f)
+        ids = (workspace.get("global") or {}).get("archivedSessionIds")
+        if isinstance(ids, list):
+            archived.update(sid for sid in ids if isinstance(sid, str))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return archived
+
+
+def archive_dsh_session(sid):
+    """Hide a DeepSeek Harness session; its own checkpoint stays untouched."""
+    _archive_scanned_session(DSH_ARCHIVED_FILE, sid)
 
 
 def remove_inactive_scanned_sessions(active):
@@ -918,6 +962,211 @@ def get_codex_title(sid):
         return ""
 
 
+def _dsh_process_starts():
+    """Return ``{pid: creation_time}`` for every live DeepSeek Harness process.
+
+    Electron spawns renderer/GPU/utility children with the same image name; the
+    caller only needs the app's lifetime, so all of them count.  An empty dict
+    means the desktop app is not running (checkpoints on disk are then stale).
+    """
+    out = {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        pids = (wintypes.DWORD * 4096)()
+        used = wintypes.DWORD()
+        if not psapi.EnumProcesses(ctypes.byref(pids), ctypes.sizeof(pids), ctypes.byref(used)):
+            return out
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                      wintypes.LPWSTR,
+                                                      ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        for pid in pids[:used.value // ctypes.sizeof(wintypes.DWORD)]:
+            if not pid:
+                continue
+            handle = kernel.OpenProcess(0x1000, False, pid)
+            if not handle:
+                continue
+            try:
+                image = ctypes.create_unicode_buffer(1024)
+                length = wintypes.DWORD(len(image))
+                if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
+                    continue
+                if os.path.basename(image.value).lower() != DSH_IMAGE:
+                    continue
+                created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+                if kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                          ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                    ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                    out[int(pid)] = ticks / 10_000_000 - 11_644_473_600
+            finally:
+                kernel.CloseHandle(handle)
+    except Exception:
+        pass
+    return out
+
+
+def _dsh_row(rows, key):
+    """One projection checkpoint row's value (or None for a missing/invalid row)."""
+    row = rows.get(key) if isinstance(rows, dict) else None
+    return row.get("val") if isinstance(row, dict) else None
+
+
+def _dsh_state(rows):
+    """Map DeepSeek Harness projection rows to a light state.
+
+    red    -- ``ask_user_question`` is waiting for an answer.
+    yellow -- a turn or step is open, tool calls are pending, or queued input
+              still has to run.
+    green  -- idle.
+
+    Permission approvals are only streamed to the renderer (the durable
+    ``approval/asked`` audit event lives inside the compressed session log),
+    so a waiting approval still reads as yellow rather than red.
+    """
+    questions = _dsh_row(rows, "userQuestions") or {}
+    active = (questions.get("questions") or {}).get("active") or []
+    if active:
+        return "red"
+    turn = _dsh_row(rows, "turnBoundary") or {}
+    stats = _dsh_row(rows, "sessionStats") or {}
+    inbox = _dsh_row(rows, "inbox") or {}
+    busy = (turn.get("openTurnStartSeq") is not None or
+            stats.get("openStep") is not None or
+            bool(stats.get("pendingCalls")) or
+            bool(inbox.get("next-turn")) or bool(inbox.get("next-step")))
+    return "yellow" if busy else "green"
+
+
+def scan_dsh_sessions(now=None):
+    """Collect DeepSeek Harness sessions from its live projection cache.
+
+    The desktop app rewrites one checkpoint document per session whenever the
+    session advances, so the light needs no hook.  Only sessions touched during
+    the current app run are listed -- otherwise checkpoints left by a previous
+    run would keep ghost sessions visible after the app was closed.  Idle
+    sessions fade out after ``DSH_ACTIVE_WINDOW``; busy ones never do.
+    """
+    now = time.time() if now is None else now
+    if now - _DSH_CACHE["checked"] < DSH_SCAN_INTERVAL:
+        return _DSH_CACHE["sessions"]
+    processes = _dsh_process_starts()
+    result = {}
+    if processes:
+        started = min(processes.values())
+        archived = _read_dsh_archived()
+        try:
+            files = os.listdir(DSH_PROJ_CACHE_DIR)
+        except OSError:
+            files = []
+        for fn in files:
+            if not fn.endswith(".json"):
+                continue
+            sid = fn[:-5]
+            if sid in archived:
+                continue
+            path = os.path.join(DSH_PROJ_CACHE_DIR, fn)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime < started - 120:      # 上一次运行留下的缓存,不当作活跃会话
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    record = (json.load(stream) or {}).get("record") or {}
+            except (OSError, ValueError):
+                continue
+            rows = record.get("rows") or {}
+            meta = _dsh_row(rows, "sessionListMetadata") or {}
+            if meta.get("blank", True) or not meta.get("lastPromptAt"):
+                continue                    # 从未发过消息的空会话
+            state = _dsh_state(rows)
+            if state == "green" and now - mtime > DSH_ACTIVE_WINDOW:
+                continue                    # 空闲会话放久后隐藏;运行中/等回答不受限
+            identity = record.get("identity") or {}
+            cwd = identity.get("cwd") or _dsh_row(rows, "workingDirectory") or ""
+            name = os.path.basename(cwd.replace("\\", "/").rstrip("/")) or sid[:8]
+            # 任务标签与 CC 侧一致:优先最近一轮的 prompt(同会话切任务时不会停在旧标题),
+            # 太短的输入(如回复「1」选项)跳过,避免标签失去信息量;都没有时退回 LLM 标题。
+            outline = _dsh_row(rows, "turnOutline") or {}
+            turns = [t for t in (outline.get("turns") or []) if isinstance(t, dict)]
+            latest_prompt = next(
+                ((t.get("prompt") or "").strip() for t in reversed(turns)
+                 if len((t.get("prompt") or "").strip()) >= 6), "")
+            fallback_prompt = (turns[-1].get("prompt") or "").strip() if turns else ""
+            title = latest_prompt or (_dsh_row(rows, "title") or "") or fallback_prompt
+            result[sid] = {
+                "provider": "dsh", "state": state, "ts": mtime,
+                "name": name, "termpid": 0, "hwnd": 0, "subs": 0,
+                "jsonl": path, "title": title,
+                # 窗口标题用的是 LLM 会话标题(不是最近 prompt),跳转匹配按它来
+                "window_title": (_dsh_row(rows, "title") or ""),
+                "jumpable": True,
+            }
+    _DSH_CACHE.update(checked=now, sessions=result)
+    return result
+
+
+def _dsh_window(title=""):
+    """Find the DeepSeek Harness desktop window, preferring this session's one.
+
+    The app is single-instance and normally owns one window; its caption is
+    ``<session title> ● DeepSeek Harness``.  If a future build opens several
+    windows, the caption match picks the one currently showing the session.
+    """
+    want = (title or "").strip().lower()
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
+        u.IsWindowVisible.restype = wintypes.BOOL
+        u.GetParent.argtypes = [wintypes.HWND]
+        u.GetParent.restype = wintypes.HWND
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextLengthW.restype = ctypes.c_int
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        ENUMWNDPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u.EnumWindows.argtypes = [ENUMWNDPROC, wintypes.LPARAM]
+        u.EnumWindows.restype = wintypes.BOOL
+        best = [None, 0]
+
+        def _cb(hwnd, _lp):
+            if not u.IsWindowVisible(hwnd) or u.GetParent(hwnd):
+                return True
+            if DSH_IMAGE not in (_window_process_name(hwnd) or "").lower():
+                return True
+            n = u.GetWindowTextLengthW(hwnd)
+            tb = ctypes.create_unicode_buffer(n + 1)
+            u.GetWindowTextW(hwnd, tb, n + 1)
+            caption = tb.value.lower()
+            score = 1
+            if "deepseek harness" in caption:
+                score += 4
+            if want and want in caption:
+                score += 8
+            if score > best[1]:
+                best[0], best[1] = hwnd, score
+            return True
+
+        u.EnumWindows(ENUMWNDPROC(_cb), 0)
+        return best[0]
+    except Exception:
+        return None
+
+
+def jump_dsh_session(title=""):
+    """Focus the DeepSeek Harness window that belongs to this session."""
+    hwnd = _dsh_window(title)
+    return bool(hwnd and focus_window(hwnd))
+
+
 def read_sessions(now=None):
     ensure_dir()
     now = now if now is not None else time.time()
@@ -952,13 +1201,15 @@ def read_sessions(now=None):
         except Exception:
             continue
     out.update(scan_codex_sessions(now))
+    out.update(scan_dsh_sessions(now))
     return out
 
 
 def effective_state(d, now=None):
     """单会话有效状态(按 config 应用超时降级)"""
     s = d.get("state", "gray")
-    if (s == "yellow" and d.get("provider") != "codex" and _config["timeout_fallback"]
+    if (s == "yellow" and d.get("provider") not in ("codex", "dsh")
+            and _config["timeout_fallback"]
             and (now if now is not None else time.time()) - d.get("ts", 0) > _config["yellow_timeout"]):
         s = "green"
     return s
@@ -2357,6 +2608,12 @@ def run_gui():
                         log_error(None, "Codex 跳转失败: sid=%s pid=%s name=%r"
                                   % (sid[:8], _t, _nm))
                     break
+                if sessions.get(sid, {}).get("provider") == "dsh":
+                    _dsh = sessions.get(sid, {})
+                    if not jump_dsh_session(_dsh.get("window_title") or _dsh.get("title") or ""):
+                        log_error(None, "DeepSeek 跳转失败: sid=%s name=%r"
+                                  % (sid[:8], _nm))
+                    break
                 # scanned=后台隐藏任务:不做任何窗口查找 —— 按项目名兜底会误中同名的 IDE 窗口,
                 # 按父链会误中后端宿主窗口;直接走焦点文件+打开管理页
                 tgt = None
@@ -2447,6 +2704,8 @@ def run_gui():
             name = d.get("name") or sid[:8]
             if d.get("provider") == "codex":
                 name = "Codex · " + name
+            elif d.get("provider") == "dsh":
+                name = "DeepSeek · " + name
             multi = names.count(d.get("name", "")) > 1
             hwnd = d.get("hwnd")
             termpid = d.get("termpid")
@@ -2459,6 +2718,7 @@ def run_gui():
             tk.Label(row, text=" " + word, fg=color, bg=BG, font=_detail_fonts["word"]).pack(side="left")
             tk.Label(row, text="  " + name, fg="#dddddd", bg=BG, font=_detail_fonts["name"]).pack(side="left")
             _title = (get_codex_title(sid) if d.get("provider") == "codex"
+                      else (d.get("title") or "") if d.get("provider") == "dsh"
                       else get_session_title(sid, d.get("jsonl")))   # 任务标签
             _label = _title or ("#" + sid[:4] if multi else "")  # 无标题:多会话用 sid 区分,单会话省略
             if _label:
@@ -2485,6 +2745,10 @@ def run_gui():
                         archive_codex_session(s)
                         _CODEX_CACHE["checked"] = 0
                         _CODEX_CACHE["sessions"].pop(s, None)
+                    elif sessions.get(s, {}).get("provider") == "dsh":
+                        archive_dsh_session(s)
+                        _DSH_CACHE["checked"] = 0
+                        _DSH_CACHE["sessions"].pop(s, None)
                     else:
                         archive_session(s)
                     close_details()
@@ -2543,7 +2807,7 @@ def run_gui():
         thr = _config["yellow_timeout"]
         now = time.time()
         for sid, d in list(read_sessions().items()):
-            if d.get("provider") == "codex":
+            if d.get("provider") in ("codex", "dsh"):
                 continue
             if d.get("scanned"):
                 j = d.get("jsonl")
