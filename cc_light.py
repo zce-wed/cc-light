@@ -540,8 +540,45 @@ def _refresh_scanned_state(d, now):
     d["ts"] = mtime
 
 
+def _is_codex_cli_command(command):
+    """Return whether a Node command line belongs to the Codex CLI.
+
+    On Windows the npm launcher runs the TUI through ``node.exe`` while the
+    shared app-server is a separate ``codex.exe`` process.  Looking only at
+    executable names therefore misses the terminal process that owns the
+    session lock.  Keep this predicate narrow so unrelated Node services are
+    never treated as Codex terminals.
+    """
+    text = (command or "").replace("\\", "/").lower()
+    return "/@openai/codex/" in text or "/node_modules/@openai/codex/" in text
+
+
+def _is_codex_exec_command(command):
+    """Return whether a Codex command is the non-interactive ``codex exec``.
+
+    ProjectManager launches Codex with ``exec --json`` through pipes and hides
+    its child window.  That process can own a rollout lock, but it has no
+    terminal HWND to focus.  Treating it as a TUI client makes its parent
+    chain resolve to an unrelated Windows Terminal window.
+    """
+    tokens = ((command or "").replace('"', " ").replace("'", " ")
+              .replace("\\", "/").lower().split())
+    return "exec" in tokens and any(
+        token == "codex.exe" or token.endswith("/codex.exe") or
+        token == "codex" or token.endswith("/codex") or
+        "@openai/codex" in token
+        for token in tokens
+    )
+
+
+def _is_codex_interactive_client(command):
+    """Return whether a Codex process can own an interactive terminal."""
+    text = (command or "").lower()
+    return "app-server" not in text and not _is_codex_exec_command(command)
+
+
 def _codex_process_starts():
-    """Return {pid: creation_time} for live codex.exe processes on Windows."""
+    """Return ``{pid: creation_time}`` for live Codex server and CLI processes."""
     out = {}
     try:
         import ctypes
@@ -568,7 +605,20 @@ def _codex_process_starts():
                 length = wintypes.DWORD(len(image))
                 if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
                     continue
-                if os.path.basename(image.value).lower() != "codex.exe":
+                image_name = os.path.basename(image.value).lower()
+                if image_name == "codex.exe":
+                    is_codex = True
+                elif image_name in ("node.exe", "nodejs.exe", "node"):
+                    # The npm-installed Windows launcher starts Codex TUI as
+                    # node.exe ...\\node_modules\\@openai\\codex\\bin\\codex.js.
+                    # _codex_process_context also reads cwd, but command-line
+                    # matching is all we need here and avoids broad Node PID
+                    # candidates later in session binding.
+                    is_codex = _is_codex_cli_command(
+                        _codex_process_context(int(pid)).get("command", ""))
+                else:
+                    is_codex = False
+                if not is_codex:
                     continue
                 created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
                 if kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
@@ -730,8 +780,13 @@ def _codex_log_state(path, cache):
 
 def _codex_terminal_pid(sid, owner, cwd, processes, contexts):
     """Resolve a writer to the most likely live Codex CLI client."""
+    owner_command = contexts.get(owner.get("pid"), {}).get("command", "")
+    # A background ``codex exec`` writer has no terminal.  Never bind it to a
+    # same-project TUI merely because their lock/cwd timestamps are close.
+    if _is_codex_exec_command(owner_command):
+        return 0
     clients = [pid for pid in processes
-               if "app-server" not in contexts[pid].get("command", "")]
+               if _is_codex_interactive_client(contexts[pid].get("command", ""))]
     explicit = [pid for pid in clients
                 if sid in [arg.strip('\"\'') for arg in
                            contexts[pid].get("command", "").split()]]
@@ -769,7 +824,7 @@ def scan_codex_sessions(now=None):
         owners = _codex_session_owners(processes)
         contexts = {pid: _codex_process_context(pid) for pid in processes}
         clients = {pid: created for pid, created in processes.items()
-                   if "app-server" not in contexts[pid].get("command", "")}
+                   if _is_codex_interactive_client(contexts[pid].get("command", ""))}
         try:
             years = os.listdir(CODEX_SESSIONS_DIR)
         except OSError:
@@ -802,6 +857,10 @@ def scan_codex_sessions(now=None):
                     if sid in archived:
                         continue
                     cwd = meta.get("cwd") or ""
+                    # ProjectManager uses ``codex exec --json`` through pipes.
+                    # It creates the same rollout/lock records as the TUI but
+                    # has no visible terminal to return to.
+                    background = str(meta.get("originator") or "").lower() == "codex_exec"
                     if owners is not None:
                         owner = owners.get(sid)
                         if not owner:
@@ -811,10 +870,11 @@ def scan_codex_sessions(now=None):
                             pid, bound_created = bound
                         else:
                             pid, bound_created = bound, None
-                        if (pid not in processes or
+                        if (background or pid not in processes or
                                 bound_created is not None and processes[pid] != bound_created or
                                 "app-server" in contexts.get(pid, {}).get("command", "")):
-                            pid = _codex_terminal_pid(sid, owner, cwd, processes, contexts)
+                            pid = (0 if background else
+                                   _codex_terminal_pid(sid, owner, cwd, processes, contexts))
                     else:
                         try:
                             started = datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00")).timestamp()
@@ -828,7 +888,8 @@ def scan_codex_sessions(now=None):
                     name = os.path.basename(cwd.replace("\\", "/").rstrip("/")) or sid[:8]
                     result[sid] = {"provider": "codex", "state": entry.get("state", "green"),
                                    "ts": mtime, "name": name, "termpid": pid,
-                                   "jsonl": path, "hwnd": 0, "subs": 0}
+                                   "jsonl": path, "hwnd": 0, "subs": 0,
+                                   "jumpable": not background}
                     if pid:
                         bindings[sid] = (pid, processes.get(pid))
     for sid in list(bindings):
@@ -1073,8 +1134,9 @@ def usage():
 
 # ---------------- CLI ----------------
 def diag_jump():
-    """自检:对每个会话模拟 _jump 跳转链(resolve_hwnd(hwnd,name) 失败 → find_window_by_pid(termpid 父链)),
-    打印每步与能否定位窗口。诊断「点击项目跳不到对应窗口」。只读 session 文件,不归档/不写。"""
+    """自检:对每个会话模拟 _jump 跳转链(find_window_by_pid(termpid 父链/控制台映射) 失败
+    → resolve_hwnd(hwnd,name)),打印每步与能否定位窗口。诊断「点击项目跳不到对应窗口」。
+    只读 session 文件,不归档/不写。"""
     ensure_dir()
     try:
         files = sorted(f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json"))
@@ -1083,7 +1145,7 @@ def diag_jump():
     if not files:
         print("(无会话)")
         return 0
-    print("跳转自检 — 模拟 _jump: resolve_hwnd(hwnd,name) 失败 → find_window_by_pid(termpid 父链)")
+    print("跳转自检 — 模拟 _jump: find_window_by_pid(termpid 父链/控制台映射) 失败 → resolve_hwnd(hwnd,name)")
     n_ok = 0
     for fn in files:
         sid = fn[:-5]
@@ -1097,11 +1159,15 @@ def diag_jump():
         hwnd = d.get("hwnd")
         tp = d.get("termpid")
         kind = "scan" if d.get("scanned") else "hook"
-        tgt = resolve_hwnd(hwnd, name)
-        via = "hwnd/name"
-        if not tgt and tp:
+        # 与 GUI 的 resolve_session_hwnd 一致:父链/控制台映射优先(WT 多窗口靠它才准),
+        # 再退回记录的 hwnd/项目名。
+        tgt, via = None, ""
+        if tp:
             tgt = find_window_by_pid(tp)
-            via = "termpid父链"
+            via = "termpid父链/控制台"
+        if not tgt:
+            tgt = resolve_hwnd(hwnd, name)
+            via = "hwnd/name"
         if tgt:
             n_ok += 1
             print("  [ OK ] %s  %-4s name=%r hwnd=%s tp=%s -> %s (%s)"
@@ -1377,7 +1443,7 @@ def focus_window(hwnd):
         return False
 
 
-def find_window_by_name(name, process_keyword=None):
+def find_window_by_name(name, process_keyword=None, terminal_only=False):
     """hwnd 失效时的兜底:按项目名模糊匹配当前可见的顶层窗口。
     Trae/VSCode reload 或窗口重建后 hwnd 会变,记录的旧 hwnd 就死了;这时用会话的项目名
     去匹配窗口标题(如 'PortraitEdit.vue - zc-geo-frontend - Trae CN' 含 'zc-geo-frontend'),
@@ -1399,6 +1465,8 @@ def find_window_by_name(name, process_keyword=None):
         # 终端/编辑器宿主窗口类(VSCode/Trae/Cursor 都是 Chrome_WidgetWin_1,WindowsTerminal 是 CASCADIA)
         term_classes = ("Chrome_WidgetWin_1", "CASCADIA_HOSTING_WINDOW_CLASS",
                         "WezTerm", "GHOSTTTY", "Xwindow", "Qt application")
+        terminal_classes = ("CASCADIA_HOSTING_WINDOW_CLASS", "ConsoleWindowClass",
+                            "PseudoConsoleWindow", "ConsoleHostClass")
         best = [None, 0]  # [hwnd, score]
 
         def _cb(hwnd, _lp):
@@ -1412,13 +1480,22 @@ def find_window_by_name(name, process_keyword=None):
             title = tb.value
             if target and (not title or target not in title.lower()):
                 return True
+            pname = (_window_process_name(hwnd) or "").lower()
             if process_keyword:
-                pname = (_window_process_name(hwnd) or "").lower()
                 if process_keyword.lower() not in pname:
                     return True
             cb = ctypes.create_unicode_buffer(256)
             u.GetClassNameW(hwnd, cb, 256)
             cls = cb.value
+            if terminal_only:
+                is_terminal_class = any(cls == c or cls.startswith(c)
+                                        for c in terminal_classes)
+                is_terminal_process = any(token in pname for token in
+                                          ("terminal", "conhost", "cmd.exe",
+                                           "powershell", "pwsh", "wezterm",
+                                           "alacritty", "conemu"))
+                if not (is_terminal_class or is_terminal_process):
+                    return True
             score = 1
             if any(cls == c or cls.startswith(c) for c in term_classes):
                 score += 5                       # 终端/编辑器宿主类优先
@@ -1505,7 +1582,78 @@ def focus_trae_terminal(hwnd, termpid):
     return False
 
 
-def find_window_by_pid(pid):
+def _console_window_map():
+    """把「拥有控制台的 shell 进程 PID」映射到它所在的精确顶层窗口。
+
+    WindowsTerminal.exe 的所有顶层窗口共用同一个进程,PID 无法区分窗口 —— 按 PID 匹配只会
+    拿到 EnumWindows 最先枚举到的那个(用户表现为「点 A 会话跳到 B 窗口」)。但每个 ConPTY
+    tab 都有一个 `PseudoConsoleWindow`,它的 GW_OWNER 正是该 tab 所属的 WT 顶层窗口,而它
+    自己的 PID 就是该 tab 的 shell(powershell/cmd)。经典 conhost 则相反:窗口类
+    `ConsoleWindowClass` 属于 conhost.exe,而 conhost 是 shell 的子进程。
+
+    返回 {shell_pid: hwnd};只收录可见宿主窗口。
+    """
+    mapping = {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        ENUMWNDPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u.EnumWindows.argtypes = [ENUMWNDPROC, wintypes.LPARAM]
+        u.EnumWindows.restype = wintypes.BOOL
+        u.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+        u.GetWindow.restype = wintypes.HWND
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.restype = ctypes.c_int
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
+        u.IsWindowVisible.restype = wintypes.BOOL
+        GW_OWNER = 4
+
+        def _pid_of(hwnd):
+            pid = wintypes.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value)
+
+        def _class_of(hwnd):
+            buf = ctypes.create_unicode_buffer(256)
+            return buf.value if u.GetClassNameW(hwnd, buf, len(buf)) else ""
+
+        def _cb(hwnd, _lp):
+            cls = _class_of(hwnd)
+            if cls == "PseudoConsoleWindow":
+                owner = u.GetWindow(hwnd, GW_OWNER)
+                if owner and u.IsWindowVisible(owner):
+                    mapping.setdefault(_pid_of(hwnd), int(owner))
+            elif cls in ("ConsoleWindowClass", "ConsoleHostClass"):
+                if u.IsWindowVisible(hwnd):
+                    conhost_pid = _pid_of(hwnd)
+                    mapping.setdefault(conhost_pid, int(hwnd))
+                    chain = _ancestor_pids(conhost_pid, max_depth=2)
+                    if len(chain) > 1:
+                        mapping.setdefault(chain[1], int(hwnd))
+            return True
+
+        u.EnumWindows(ENUMWNDPROC(_cb), 0)
+    except Exception:
+        return {}
+    return mapping
+
+
+def _window_for_console_pids(pids):
+    """沿父链(近→远)找第一个拥有控制台窗口的进程,返回其精确宿主窗口。"""
+    if not pids:
+        return None
+    mapping = _console_window_map()
+    for p in pids:
+        hwnd = mapping.get(int(p))
+        if hwnd:
+            return hwnd
+    return None
+
+
+def find_window_by_pid(pid, unique=False):
     """按进程 PID 沿【父链】找一个可见顶层窗口。termpid 是 powershell(无窗口),真正的终端/
     编辑器窗口在祖父(WindowsTerminal/Trae 主进程),所以收集 termpid 及其祖先 pid,一次
     EnumWindows 选父链中最近进程拥有的可见顶层窗口。scanned 会话 hwnd 失效/为 0 时,
@@ -1513,6 +1661,10 @@ def find_window_by_pid(pid):
     pids = _ancestor_pids(pid)
     if not pids:
         return None
+    # 先走控制台映射:WT 所有顶层窗口共享同一 PID,按 PID 只能拿到第一个窗口(必错)。
+    exact = _window_for_console_pids(pids)
+    if exact:
+        return exact
     ranks = {p: rank for rank, p in enumerate(pids)}
     try:
         import ctypes
@@ -1525,6 +1677,7 @@ def find_window_by_pid(pid):
         ENUMWNDPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         u.EnumWindows.argtypes = [ENUMWNDPROC, wintypes.LPARAM]; u.EnumWindows.restype = wintypes.BOOL
         found = [None, len(pids)]
+        same_rank = []
 
         def _cb(hwnd, _lp):
             if not u.IsWindowVisible(hwnd) or u.GetParent(hwnd):
@@ -1534,11 +1687,16 @@ def find_window_by_pid(pid):
             rank = ranks.get(v.value, len(pids))
             if rank < found[1]:
                 found[:] = [hwnd, rank]
-                if rank == 0:
+                same_rank[:] = [hwnd]
+                if not unique and rank == 0:
                     return False
+            elif unique and rank == found[1]:
+                same_rank.append(hwnd)
             return True
 
         u.EnumWindows(ENUMWNDPROC(_cb), 0)
+        if unique:
+            return same_rank[0] if len(same_rank) == 1 else None
         return found[0]
     except Exception:
         return None
@@ -1624,18 +1782,187 @@ def _is_trae_wnd(hwnd):
     return "trae" in _window_process_name(hwnd).lower()
 
 
-def jump_codex_session(pid, name):
+def _find_codex_window(names):
+    """Find a terminal window whose title belongs to a Codex session.
+
+    Windows Terminal can host several top-level windows in one process, so a
+    parent PID identifies the host process but not the correct HWND. Codex
+    updates the terminal title with the thread title/project; use that signal
+    only when it was actually supplied.  The caller deliberately decides when
+    a project-name fallback is safe: several Codex sessions in one project
+    have the same project name and must never be resolved by that name alone.
+    """
+    seen = set()
+    for value in names or ():
+        value = (value or "").strip()
+        key = value.lower()
+        if len(value) < 2 or key in seen:
+            continue
+        seen.add(key)
+        # A desktop Codex window can also contain the same thread title.  Its
+        # process name is therefore not a reliable terminal discriminator;
+        # prefer Windows Terminal/conhost and then terminal window classes.
+        for keyword in ("windowsterminal", "conhost"):
+            target = find_window_by_name(value, process_keyword=keyword)
+            if target:
+                return target
+        target = find_window_by_name(value, terminal_only=True)
+        if target:
+            return target
+    return None
+
+
+def _window_class(hwnd):
+    """Return a window class name without raising on stale HWNDs."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.restype = ctypes.c_int
+        buf = ctypes.create_unicode_buffer(256)
+        return buf.value if u.GetClassNameW(hwnd, buf, len(buf)) else ""
+    except Exception:
+        return ""
+
+
+def _terminal_window_for_pid(pid):
+    """Resolve a process to the exact terminal window hosting its console.
+
+    ``WindowsTerminal.exe`` is shared by all top-level windows, so walking the
+    process parent chain cannot distinguish them.  The ConPTY mapping below is
+    exact and needs no process attachment; ``_attached_console_window`` is the
+    classic-conhost fallback for hosts whose console window is not linked to
+    the shell through ``PseudoConsoleWindow``.
+    """
+    if not pid:
+        return None
+    pids = _ancestor_pids(pid)
+    exact = _window_for_console_pids(pids)
+    if exact:
+        return exact
+    return _attached_console_window(pids)
+
+
+def _attached_console_window(pids):
+    """Fallback: attach to the shell and walk its console window to the host.
+
+    The helper is best effort.  Some Codex processes are detached from a
+    console (for example ``codex exec``), in which case the normal title/PID
+    fallbacks remain available.
+    """
+    if not pids:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        k.GetConsoleWindow.argtypes = []
+        k.GetConsoleWindow.restype = wintypes.HWND
+        k.AttachConsole.argtypes = [wintypes.DWORD]
+        k.AttachConsole.restype = wintypes.BOOL
+        k.FreeConsole.argtypes = []
+        k.FreeConsole.restype = wintypes.BOOL
+        u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        u.GetAncestor.restype = wintypes.HWND
+        u.GetParent.argtypes = [wintypes.HWND]
+        u.GetParent.restype = wintypes.HWND
+        u.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+        u.GetWindow.restype = wintypes.HWND
+        u.IsWindow.argtypes = [wintypes.HWND]
+        u.IsWindow.restype = wintypes.BOOL
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
+        u.IsWindowVisible.restype = wintypes.BOOL
+
+        # A GUI pythonw process normally has no console.  Never detach a
+        # console that belongs to the caller if cc-light was started from a
+        # console for debugging.
+        if k.GetConsoleWindow():
+            return None
+
+        # Try the client and its shell/conhost ancestors.  AttachConsole only
+        # succeeds for a process that still owns a console, so this also deals
+        # with cmd/PowerShell wrappers around the native Codex client.
+        for candidate_pid in pids:
+            attached = bool(k.AttachConsole(int(candidate_pid)))
+            if not attached:
+                continue
+            try:
+                console = k.GetConsoleWindow()
+                if not console:
+                    continue
+                # PseudoConsoleWindow is usually owned by the WT host.  Walk
+                # both owner and parent links because the exact relationship
+                # differs between Windows Terminal releases.
+                pending = [int(console)]
+                seen = set()
+                while pending:
+                    hwnd = pending.pop(0)
+                    if not hwnd or hwnd in seen or not u.IsWindow(hwnd):
+                        continue
+                    seen.add(hwnd)
+                    cls = _window_class(hwnd)
+                    if cls == "CASCADIA_HOSTING_WINDOW_CLASS" and u.IsWindowVisible(hwnd):
+                        return hwnd
+                    for relation in (4,):  # GW_OWNER; parent/ancestor below
+                        try:
+                            related = u.GetWindow(hwnd, relation)
+                        except Exception:
+                            related = 0
+                        if related and related not in seen:
+                            pending.append(int(related))
+                    parent = u.GetParent(hwnd)
+                    if parent and int(parent) not in seen:
+                        pending.append(int(parent))
+                    root = u.GetAncestor(hwnd, 2)  # GA_ROOT
+                    if root and int(root) not in seen:
+                        pending.append(int(root))
+            finally:
+                k.FreeConsole()
+            # If this process exposed a console but the relationship did not
+            # lead back to a WT host, try the next ancestor (cmd/PowerShell or
+            # conhost can expose a different pseudo-console handle).
+    except Exception:
+        return None
+    return None
+
+
+def jump_codex_session(pid, name, title=None):
     """Focus the existing terminal that owns this session's CLI process.
 
     Project names and shared app-server processes do not identify a terminal.
-    Only send the Trae terminal selector when the resolved host is Trae.
+    Prefer the live process ancestry.  If the process has already detached,
+    use a Codex window title as a final recovery path.
     """
-    if not pid:
-        return False
-    target = find_window_by_pid(pid)
+    # The process's console is the exact locator: each ConPTY tab's
+    # PseudoConsoleWindow is owned by its Windows Terminal top-level window.
+    target = _terminal_window_for_pid(pid) if pid else None
+    # Fall back to the unique Codex thread title. Do not pass the project name
+    # in the same lookup: if three Codex sessions share ``cc-light``, the first
+    # title-less match is exactly the wrong second-window jump users see.
+    title_keys = []
+    if title:
+        # Current Codex captions are usually ``<thread> | <project>``.  The
+        # combined key avoids selecting an older window with the same short
+        # thread name when several sessions are open at once.
+        if name:
+            title_keys.append("%s | %s" % (title, name))
+        title_keys.append(title)
+    if not target and title_keys:
+        target = _find_codex_window(tuple(title_keys))
+    # A project-name lookup is safe only when no per-thread title exists.  It
+    # is retained for old Codex builds that never set a title, but never used
+    # as a fallback after a title lookup failed.
+    if not target and not title:
+        target = _find_codex_window((name,))
     if not target:
-        return False
-    if _window_process_name(target).lower() == "codex.exe":
+        # A shared WindowsTerminal.exe owns several top-level HWNDs.  The
+        # ancestry fallback is acceptable only when it yields one candidate;
+        # choosing the first enumeration result recreates the third-to-second
+        # jump.
+        target = find_window_by_pid(pid, unique=True) if pid else None
+    if not target:
         return False
     focused = focus_window(target)
     if _is_trae_wnd(target):
@@ -2020,7 +2347,13 @@ def run_gui():
                 if _s != sid:
                     continue
                 if sessions.get(sid, {}).get("provider") == "codex":
-                    if not jump_codex_session(_t, sessions[sid].get("name") or ""):
+                    _codex = sessions.get(sid, {})
+                    if _codex.get("jumpable") is False:
+                        log_error(None, "Codex 会话没有可返回的终端: sid=%s name=%r"
+                                  % (sid[:8], _nm))
+                        break
+                    _title = get_codex_title(sid)
+                    if not jump_codex_session(_t, _codex.get("name") or "", _title):
                         log_error(None, "Codex 跳转失败: sid=%s pid=%s name=%r"
                                   % (sid[:8], _t, _nm))
                     break

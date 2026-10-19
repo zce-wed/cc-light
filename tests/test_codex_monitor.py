@@ -15,6 +15,27 @@ def _event(kind):
     return json.dumps({"type": "event_msg", "payload": {"type": kind}}) + "\n"
 
 
+def test_codex_cli_command_matches_npm_node_launcher():
+    assert light._is_codex_cli_command(
+        r'C:\Program Files\nodejs\node.exe C:\Program Files\nodejs\node_modules\@openai\codex\bin\codex.js --no-daemon'
+    ) is True
+    assert light._is_codex_cli_command(
+        r'C:\tools\node.exe C:\work\server\index.js'
+    ) is False
+
+
+def test_codex_exec_is_not_an_interactive_terminal_client():
+    assert light._is_codex_exec_command(
+        r'C:\Program Files\nodejs\node.exe C:\Program Files\nodejs\node_modules\@openai\codex\bin\codex.js exec --json -'
+    ) is True
+    assert light._is_codex_exec_command(
+        r'C:\tools\codex.exe exec --json --dangerously-bypass-approvals-and-sandbox'
+    ) is True
+    assert light._is_codex_interactive_client(
+        r'C:\tools\codex.exe resume 01a13916-63e4-7dc1-95d2-923612c71341'
+    ) is True
+
+
 def _check_codex_turns_and_process_lifetime(tmp_path):
     now = time.time()
     sid = "codex-test-session"
@@ -96,6 +117,65 @@ def test_shared_daemon_uses_lock_time_to_choose_terminal():
                                      processes, contexts) == 200
 
 
+def test_background_exec_writer_never_binds_to_same_project_tui():
+    contexts = {
+        100: {"command": "codex.exe exec --json -", "cwd": "c:/work"},
+        200: {"command": "codex.exe", "cwd": "c:/work"},
+    }
+    assert light._codex_terminal_pid("thread", {"pid": 100, "ts": 2.1},
+                                     "c:/work", {100: 1, 200: 2}, contexts) == 0
+
+
+def test_codex_exec_rollout_is_marked_non_jumpable():
+    now = time.time()
+    sid = "33333333-3333-3333-3333-333333333333"
+    with tempfile.TemporaryDirectory() as folder:
+        logs = Path(folder) / datetime.fromtimestamp(now).strftime("%Y/%m/%d")
+        logs.mkdir(parents=True)
+        path = logs / ("rollout-test-" + sid + ".jsonl")
+        path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": sid, "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "cwd": "C:/work", "originator": "codex_exec"}}) + "\n" +
+                         _event("task_started"), encoding="utf-8")
+        with patch.object(light, "CODEX_SESSIONS_DIR", str(folder)), \
+             patch.object(light, "_codex_process_starts", return_value={100: now - 10}), \
+             patch.object(light, "_codex_process_context",
+                          return_value={"command": "codex.exe exec --json -"}), \
+             patch.object(light, "_codex_session_owners",
+                          return_value={sid: {"pid": 100, "ts": now - 1}}), \
+             patch.object(light, "_CODEX_CACHE", {"checked": 0, "sessions": {}, "logs": {}}):
+            session = light.scan_codex_sessions(now)[sid]
+            assert session["termpid"] == 0
+            assert session["jumpable"] is False
+
+
+def test_shared_daemon_binds_to_node_codex_cli_client():
+    now = time.time()
+    sid = "11111111-1111-1111-1111-111111111111"
+    cwd = os.path.normcase(os.path.normpath("C:/work/sample-project"))
+    with tempfile.TemporaryDirectory() as folder:
+        logs = Path(folder) / datetime.fromtimestamp(now).strftime("%Y/%m/%d")
+        logs.mkdir(parents=True)
+        path = logs / ("rollout-test-" + sid + ".jsonl")
+        path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": sid, "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "cwd": cwd}}) + "\n" + _event("task_started"), encoding="utf-8")
+        processes = {100: now - 3600, 200: now - 30}
+        contexts = {
+            100: {"command": "codex.exe app-server --managed-daemon"},
+            200: {"command": r"node.exe C:\\node_modules\\@openai\\codex\\bin\\codex.js --no-daemon",
+                  "cwd": cwd},
+        }
+        with patch.object(light, "CODEX_SESSIONS_DIR", folder), \
+             patch.object(light, "_codex_process_starts", return_value=processes), \
+             patch.object(light, "_codex_process_context", side_effect=contexts.get), \
+             patch.object(light, "_codex_session_owners",
+                          return_value={sid: {"pid": 100, "ts": now - 5}}), \
+             patch.object(light, "_CODEX_CACHE", {"checked": 0, "sessions": {}, "logs": {}}):
+            sessions = light.scan_codex_sessions(now)
+            assert sessions[sid]["termpid"] == 200
+
+
 def test_background_daemon_without_terminal_has_no_jump_pid():
     assert light._codex_terminal_pid("thread", {"pid": 100}, "C:/work",
         {100: 1}, {100: {"command": "codex.exe app-server"}}) == 0
@@ -167,9 +247,13 @@ def test_windows_lock_ownership_ignores_closed_handles():
 
 
 if __name__ == "__main__":
+    test_codex_cli_command_matches_npm_node_launcher()
     test_codex_turns_and_process_lifetime()
     test_resumed_daemon_threads_use_live_ownership()
     test_shared_daemon_uses_lock_time_to_choose_terminal()
+    test_background_exec_writer_never_binds_to_same_project_tui()
+    test_codex_exec_rollout_is_marked_non_jumpable()
+    test_shared_daemon_binds_to_node_codex_cli_client()
     test_background_daemon_without_terminal_has_no_jump_pid()
     test_missing_cwd_falls_back_to_live_cli_client()
     test_unowned_rollouts_do_not_match_background_daemon()
