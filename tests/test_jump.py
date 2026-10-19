@@ -306,6 +306,79 @@ def test_resolve_session_hwnd_falls_back_to_recorded_window():
         by_hwnd.assert_called_once_with(123, "project")
 
 
+def test_is_background_task_detects_projectmanager_headless_session():
+    # PM 后端代写:scanned + hwnd/termpid 恒 0(无终端窗口)
+    d = {"scanned": True, "hwnd": 0, "termpid": 0, "jsonl": "x.jsonl"}
+    assert L.is_background_task(d) is True
+
+
+def test_is_background_task_supports_explicit_bg_flag():
+    assert L.is_background_task({"bg": True}) is True
+
+
+def test_is_background_task_detects_pm_agent_server_child():
+    # 点击第一个会话误跳第二个的现场:PM agent-server(node)spawn 的 claude,
+    # termpid 是后端 node,父链没有终端窗口 → 必须判为后台,不能按项目名兜底。
+    with patch.object(L, "is_process_alive", return_value=True), \
+         patch.object(L, "_is_terminal_session", return_value=False):
+        assert L.is_background_task({"hwnd": 0, "termpid": 18796}) is True
+
+
+def test_is_background_task_keeps_terminal_session():
+    with patch.object(L, "is_process_alive", return_value=True), \
+         patch.object(L, "_is_terminal_session", return_value=True):
+        assert L.is_background_task({"hwnd": 0, "termpid": 4460}) is False
+        assert L.is_background_task({"scanned": True, "hwnd": 0, "termpid": 4460}) is False
+
+
+def test_is_background_task_ignores_dead_termpid():
+    # 终端进程已结束 → 交给正常分支提示「找不到终端窗口」,不冒充后台任务
+    with patch.object(L, "is_process_alive", return_value=False), \
+         patch.object(L, "_is_terminal_session", return_value=False):
+        assert L.is_background_task({"hwnd": 0, "termpid": 9999}) is False
+
+
+def test_is_background_task_false_for_hook_session():
+    with patch.object(L, "is_process_alive", return_value=False):
+        assert L.is_background_task({"hwnd": 123, "termpid": 456}) is False
+    assert L.is_background_task({}) is False
+    assert L.is_background_task(None) is False
+
+
+def test_is_terminal_session_uses_console_window_map():
+    with patch.object(L, "_ancestor_pids", return_value=[4460, 3532, 17184]), \
+         patch.object(L, "_window_for_console_pids", return_value=199766):
+        assert L._is_terminal_session(4460) is True
+
+
+def test_is_terminal_session_accepts_shell_without_console_map():
+    with patch.object(L, "_ancestor_pids", return_value=[4460, 3532]), \
+         patch.object(L, "_window_for_console_pids", return_value=None), \
+         patch.object(L, "_process_image_name", return_value="cmd.exe"):
+        assert L._is_terminal_session(4460) is True
+
+
+def test_is_terminal_session_rejects_service_process_chain():
+    # PM agent-server 链:node(18796) -> node(14576) -> dead
+    with patch.object(L, "_ancestor_pids", return_value=[18796, 14576, 16368]), \
+         patch.object(L, "_window_for_console_pids", return_value=None), \
+         patch.object(L, "_process_image_name", return_value="node.exe"):
+        assert L._is_terminal_session(18796) is False
+
+
+def test_write_focus_file_payload():
+    import json, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "focus.json")
+        with patch.object(L, "MANAGER_FOCUS_FILE", p):
+            L.write_focus_file("sid123", "zcvip-front")
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    assert d["sid"] == "sid123"
+    assert d["proj"] == "zcvip-front"
+    assert isinstance(d["ts"], int) and d["ts"] > 0
+
+
 def test_find_trae_window_falls_back_without_project_title():
     with patch.object(L, "find_window_by_name", side_effect=[None, 456]) as by_name:
         assert L.find_trae_window("project") == 456

@@ -56,6 +56,9 @@ DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30
 ERROR_LOG = os.path.join(DATA_DIR, "error.log")          # 异常日志(右键「错误日志」查看,复制丢给排查)
 MAX_ERROR_LOG = 200   # 异常日志保留最近 N 条(超 500KB 自动截断)
 ORDER_FILE = os.path.join(DATA_DIR, "order.json")   # 用户拖拽排序的会话顺序 [sid,...]
+# ProjectManager 后台任务:点击时不自动开浏览器,只在灯窗口提示用户自行去管理页查看
+MANAGER_URL = "http://192.168.1.165:3667/#/work/tapd"
+MANAGER_FOCUS_FILE = r"C:\Users\zhongce-pm\Desktop\newWork\ProjectManager\data\tapd_sync\focus.json"
 
 # ---- 自愈:坚果云覆盖 settings.json 冲掉 hook 时,灯窗口定期重注入 ----
 MARKER = "cc-light/"   # hook 命令路径里都含这个,用于识别/清理 cc-light entry
@@ -2233,6 +2236,86 @@ def resolve_hwnd(hwnd, name):
     return find_window_by_name(name)
 
 
+_SHELL_EXES = {"powershell.exe", "pwsh.exe", "cmd.exe", "bash.exe", "wsl.exe",
+               "sh.exe", "zsh.exe", "fish.exe", "mintty.exe", "conhost.exe"}
+
+
+def _process_image_name(pid):
+    """进程可执行文件名(小写,如 node.exe)——判断会话父进程是终端 shell 还是后台服务。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                 wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            n = wintypes.DWORD(len(buf))
+            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return os.path.basename(buf.value).lower()
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
+def _is_terminal_session(termpid):
+    """会话是否跑在真实终端里(点击有窗口可跳)。
+
+    判据:父链上有进程拥有控制台窗口(ConPTY 的 PseudoConsoleWindow / 经典 conhost),
+    或父链前几层出现终端 shell。ProjectManager agent-server 等后台服务 spawn 的 claude
+    父链是 node/node/dead,既没有 shell 也没有控制台窗口 —— 不能当终端会话,否则会按项目名
+    兜底误匹配到别的窗口(比如另一个终端标题恰好含 "ProjectManager")。
+    """
+    if not termpid:
+        return False
+    chain = _ancestor_pids(int(termpid))
+    if not chain:
+        return False
+    if _window_for_console_pids(chain):
+        return True
+    return any(_process_image_name(p) in _SHELL_EXES for p in chain[:4])
+
+
+def is_background_task(d):
+    """是否 ProjectManager 后台任务(没有终端窗口可跳)。
+
+    - 管理页 -p 无头任务:后端代写 session,scanned=true 且 hwnd/termpid 恒 0;
+    - PM agent-server/Copilot spawn 的会话:hook 正常写,但 termpid 是后端 node 进程,
+      父链没有终端 shell/控制台窗口(CC_LIGHT_BG 只标记 -p 无头任务,覆盖不到这类)。
+    这类会话点击时应提示用户自行去管理页查看,不能按项目名兜底 —— 会误跳同名终端窗口。
+    注意「检测所有会话」补建的 scanned 终端会话也是 scanned,但 termpid 来自活 shell,
+    _is_terminal_session 会放行。
+    """
+    if not d:
+        return False
+    if d.get("bg"):
+        return True
+    if bool(d.get("scanned")) and not d.get("hwnd") and not d.get("termpid"):
+        return True
+    tp = d.get("termpid")
+    if not tp or not is_process_alive(tp):
+        return False
+    return not _is_terminal_session(tp)
+
+
+def write_focus_file(sid, name):
+    """写焦点文件:已打开的 ProjectManager 管理页 2s 内轮询到后自动切项目(不开新窗口)。"""
+    try:
+        with open(MANAGER_FOCUS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"sid": sid, "proj": name or "", "ts": int(time.time() * 1000)}, f)
+    except Exception:
+        pass
+
+
 def resolve_session_hwnd(hwnd, termpid, name):
     """Resolve a session's host window, preferring its live process ancestry.
 
@@ -2365,6 +2448,39 @@ def run_gui():
                 tip[0] = None
         widget.bind("<Enter>", _show, add="+")
         widget.bind("<Leave>", _hide, add="+")
+
+    notice_win = [None]
+
+    def show_notice(text, ms=6000):
+        """灯窗口旁弹一条短暂提示(自动消失)——后台任务没有终端可跳时,替代自动打开浏览器。"""
+        if notice_win[0] is not None:
+            try: notice_win[0].destroy()
+            except Exception: pass
+            notice_win[0] = None
+        try:
+            t = tk.Toplevel(root)
+            t.overrideredirect(True)
+            t.attributes("-topmost", True)
+            t.configure(bg="#2a2a2a")
+            tk.Label(t, text=text, bg="#2a2a2a", fg="#e8e8e8",
+                     font=("Microsoft YaHei", 9), padx=12, pady=8,
+                     justify="left").pack()
+            t.update_idletasks()
+            x = root.winfo_x() + root.winfo_width() + 8
+            if x + t.winfo_width() > root.winfo_screenwidth():   # 贴右屏边 → 改放左侧
+                x = max(0, root.winfo_x() - t.winfo_width() - 8)
+            y = max(0, root.winfo_y() + root.winfo_height() - t.winfo_height())
+            t.geometry("+%d+%d" % (x, y))
+            notice_win[0] = t
+            root.after(ms, lambda: _hide_notice(t))
+        except Exception:
+            pass
+
+    def _hide_notice(t):
+        if notice_win[0] is t:
+            try: t.destroy()
+            except Exception: pass
+            notice_win[0] = None
 
     def default_geo():
         wa = work_area()
@@ -2614,32 +2730,30 @@ def run_gui():
                         log_error(None, "DeepSeek 跳转失败: sid=%s name=%r"
                                   % (sid[:8], _nm))
                     break
-                # scanned=后台隐藏任务:不做任何窗口查找 —— 按项目名兜底会误中同名的 IDE 窗口,
-                # 按父链会误中后端宿主窗口;直接走焦点文件+打开管理页
+                # ProjectManager 后台无头任务(CC_LIGHT_BG=1):没有终端窗口可跳。不自动打开
+                # 浏览器,只在灯窗口提示用户自行去管理页查看;焦点文件照写(已开着的页面自动切项目)。
+                if is_background_task(sessions.get(sid, {})):
+                    log_error(None, "跳转后台任务(提示去管理页): sid=%s name=%r"
+                              % (sid[:8], _nm))
+                    write_focus_file(sid, _nm)
+                    show_notice("「%s」由 ProjectManager 助手在后台运行\n"
+                                "请在浏览器打开查看：\n%s" % (_nm, MANAGER_URL))
+                    break
+                # 终端会话(含 hook 没注入、「检测所有会话」补建的 scanned):按活进程父链
+                # 定位终端窗口。scanned 不做按标题兜底 —— 会误中同项目的 IDE 窗口。
                 tgt = None
-                if not _sc:
-                    tgt = resolve_session_hwnd(_h, _t, _nm)
+                if _t:
+                    tgt = find_window_by_pid(_t)
+                if not tgt and not _sc:
+                    tgt = resolve_hwnd(_h, _nm)
                 if tgt:
                     if not focus_window(tgt):
                         log_error(None, "跳转 focus 失败(前台锁定?): sid=%s name=%r hwnd=%s tgt=%s"
                                   % (sid[:8], _nm, _h, tgt))
                 else:
-                    # 后台隐藏任务(ProjectManager 管理页 spawn 的 claude,无终端窗口):
-                    # 写焦点文件(页面 2s 内自动切对应项目) + 打开/跳转管理页
-                    log_error(None, "跳转找不到窗口(后台任务→切管理页): sid=%s name=%r termpid=%s"
+                    log_error(None, "跳转找不到终端窗口: sid=%s name=%r termpid=%s"
                               % (sid[:8], _nm, _t))
-                    try:
-                        import json, time
-                        with open(r"C:\Users\zhongce-pm\Desktop\newWork\ProjectManager\data\tapd_sync\focus.json",
-                                  "w", encoding="utf-8") as _f:
-                            json.dump({"sid": sid, "proj": _nm or "", "ts": int(time.time() * 1000)}, _f)
-                    except Exception:
-                        pass
-                    try:
-                        import webbrowser
-                        webbrowser.open("http://192.168.1.165:3667/#/work/tapd")
-                    except Exception:
-                        pass
+                    show_notice("找不到「%s」的终端窗口（可能已关闭）" % _nm)
                 # The hwnd may be missing or recorded differently for each
                 # session even when Trae hosts them in one workbench. The PID
                 # chain is the source of truth for selecting the terminal.
