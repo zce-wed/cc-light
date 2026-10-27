@@ -1068,7 +1068,12 @@ def scan_codex_sessions(now=None):
                         continue
                     path = os.path.join(root, fn)
                     # The filename lets us skip history without parsing its large metadata.
-                    filename_sid = fn[-42:-6]
+                    # Resumed/migrated rollouts can end in <thread>_<writer>.jsonl.
+                    # The first UUID is the thread; the final UUID is not its lock id.
+                    match = re.search(
+                        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=[_.])",
+                        fn, re.IGNORECASE)
+                    filename_sid = match.group(1) if match else fn[-42:-6]
                     if owners is not None and filename_sid not in owners:
                         continue
                     try:
@@ -1451,6 +1456,35 @@ def aggregate(sessions):
     best = min((PRIO.get(s, 99) for s in states), default=99)
     inv = {v: k for k, v in PRIO.items()}
     return inv.get(best, "gray"), len(sessions)
+
+
+def hide_session(sid, session):
+    """Use the same persistent user-delete semantics for individual/bulk actions."""
+    provider = session.get("provider")
+    if provider == "codex":
+        archive_codex_session(sid)
+        _CODEX_CACHE["checked"] = 0
+        _CODEX_CACHE["sessions"].pop(sid, None)
+    elif provider == "dsh":
+        archive_dsh_session(sid)
+        _DSH_CACHE["checked"] = 0
+        _DSH_CACHE["sessions"].pop(sid, None)
+    else:
+        archive_session(sid, user_hidden=True)
+
+
+def keep_working_sessions(now=None):
+    """One-shot cleanup: keep running/waiting rows, hide completed/idle rows."""
+    now = time.time() if now is None else now
+    # Recheck providers instead of deleting based on a stale green UI snapshot.
+    _CODEX_CACHE["checked"] = 0
+    _DSH_CACHE["checked"] = 0
+    removed = 0
+    for sid, session in list(read_sessions(now).items()):
+        if effective_state(session, now) not in ("yellow", "red"):
+            hide_session(sid, session)
+            removed += 1
+    return removed
 
 
 def _find_node():
@@ -3207,16 +3241,7 @@ def _run_gui():
                             activebackground="#3a3a3a", activeforeground="#ffffff")
                 def _do():
                     detail_menu_active[0] = False
-                    if sessions.get(s, {}).get("provider") == "codex":
-                        archive_codex_session(s)
-                        _CODEX_CACHE["checked"] = 0
-                        _CODEX_CACHE["sessions"].pop(s, None)
-                    elif sessions.get(s, {}).get("provider") == "dsh":
-                        archive_dsh_session(s)
-                        _DSH_CACHE["checked"] = 0
-                        _DSH_CACHE["sessions"].pop(s, None)
-                    else:
-                        archive_session(s, user_hidden=True)
+                    hide_session(s, sessions.get(s, {}))
                     close_details()
                     root.after(20, details_hover)
                 m.add_command(label="删除该会话", command=_do)
@@ -3264,6 +3289,14 @@ def _run_gui():
         _place()
         win.bind("<Enter>", lambda e: cancel_close())
         win.bind("<Leave>", lambda e: schedule_close())
+
+    def keep_working():
+        keep_working_sessions()
+        close_details()
+        sessions = read_sessions()
+        c, n = aggregate(sessions)
+        apply(c)
+        render_dots(sessions, time.time())
 
     def cleanup_stale():
         """归档超过超时阈值无更新的会话(归档而非真删,可用「检测所有会话」还原)。
@@ -4187,6 +4220,7 @@ def _run_gui():
     other_menu.add_cascade(label="监测范围", menu=monitor_menu)
 
     menu = tk.Menu(root, tearoff=0)
+    menu.add_command(label="仅保留工作中会话", command=keep_working)
     menu.add_command(label="清理不活跃会话", command=cleanup_stale)
     menu.add_command(label="检测所有会话", command=restore_sessions)   # 还原被清理/删除的会话
     menu.add_command(label="错误日志", command=show_error_log)   # 显示异常日志,可复制丢给排查

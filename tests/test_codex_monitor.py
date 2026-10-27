@@ -324,6 +324,40 @@ def test_guardian_review_detection_uses_internal_type_not_title():
         assert not light._is_codex_guardian_review(meta)
 
 
+def test_resumed_rollout_with_writer_suffix_restores_only_after_user_message():
+    now = time.time()
+    sid = "11111111-1111-7111-8111-111111111111"
+    writer = "22222222-2222-7222-8222-222222222222"
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        logs = root / datetime.fromtimestamp(now).strftime("%Y/%m/%d")
+        logs.mkdir(parents=True)
+        rollout = logs / ("rollout-2026-10-26T17-03-29-" + sid + "_" + writer + ".jsonl")
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": sid, "cwd": "C:/work/resumed"}}) + "\n" +
+            _event("task_started") + _event("user_message"), encoding="utf-8")
+        with patch.object(light, "CODEX_SESSIONS_DIR", folder), \
+             patch.object(light, "CODEX_ARCHIVED_FILE", str(root / "archived.json")), \
+             patch.object(light, "_codex_process_starts", return_value={100: now - 10}), \
+             patch.object(light, "_codex_process_context", return_value={}), \
+             patch.object(light, "_codex_session_owners", return_value={sid: {"pid": 100, "ts": now}}), \
+             patch.object(light, "_CODEX_CACHE", {"checked": 0, "sessions": {}, "logs": {}}):
+            assert light.scan_codex_sessions(now)[sid]["state"] == "yellow"
+            light.archive_codex_session(sid)
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(_event("task_complete") + _event("task_started"))
+            assert sid not in light.scan_codex_sessions(now + 4)
+            light._CODEX_CACHE.update(checked=0, sessions={}, logs={})
+            assert sid not in light.scan_codex_sessions(now + 8)
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "item_completed", "item": {"type": "UserMessage", "id": "new-prompt"}}}) + "\n")
+            assert light.scan_codex_sessions(now + 12)[sid]["state"] == "yellow"
+            assert sid not in light._read_codex_archived()
+            light._CODEX_CACHE.update(checked=0, sessions={}, logs={})
+            assert sid in light.scan_codex_sessions(now + 16)
+
+
 def test_guardian_sessions_stay_out_despite_new_machine_messages_and_new_ids():
     now = time.time()
     guardian = "11111111-1111-1111-1111-111111111111"
