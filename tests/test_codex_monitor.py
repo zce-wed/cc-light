@@ -231,6 +231,74 @@ def test_archived_codex_rollout_is_hidden_without_deleting_log():
             assert sid not in light.scan_codex_sessions(now + 4)
             assert rollout.exists()
 
+            # Completion and ordinary log writes do not undo a user's delete.
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(_event("task_complete"))
+            assert sid not in light.scan_codex_sessions(now + 8)
+
+            # A restart must preserve the hide, then a new prompt restores it.
+            light._CODEX_CACHE.update(checked=0, sessions={}, logs={})
+            assert sid not in light.scan_codex_sessions(now + 12)
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(_event("task_started"))
+            assert sid not in light.scan_codex_sessions(now + 16)
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(_event("user_message"))
+            light._CODEX_CACHE["checked"] = 0
+            restored = light.scan_codex_sessions(now + 16)[sid]
+            assert restored["state"] == "yellow"
+            assert light.effective_state(restored, now + 10000) == "yellow"
+            assert sid not in json.loads(archived.read_text(encoding="utf-8"))
+
+            # Once restored, it stays visible after completion and restart.
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(_event("task_complete"))
+            light._CODEX_CACHE.update(checked=0, sessions={}, logs={})
+            assert light.scan_codex_sessions(now + 20)[sid]["state"] == "green"
+
+            # A whole quick turn between polls also restores the finished row.
+            light.archive_codex_session(sid)
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(_event("task_started") + json.dumps({"type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": []}}) + "\n" + _event("task_complete"))
+            assert light.scan_codex_sessions(now + 24)[sid]["state"] == "green"
+
+
+def test_legacy_codex_hides_wait_for_a_new_user_message():
+    now = time.time()
+    sid = "44444444-4444-4444-4444-444444444444"
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        logs = root / datetime.fromtimestamp(now).strftime("%Y/%m/%d")
+        logs.mkdir(parents=True)
+        rollout = logs / ("rollout-test-" + sid + ".jsonl")
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": sid, "cwd": "C:/work"}}) + "\n" + _event("task_complete"),
+            encoding="utf-8")
+        archived = root / "archived.json"
+        archived.write_text(json.dumps([sid]), encoding="utf-8")
+        with patch.object(light, "CODEX_SESSIONS_DIR", folder), \
+             patch.object(light, "CODEX_ARCHIVED_FILE", str(archived)), \
+             patch.object(light, "_codex_process_starts", return_value={100: now - 10}), \
+             patch.object(light, "_codex_process_context", return_value={}), \
+             patch.object(light, "_codex_session_owners",
+                          return_value={sid: {"pid": 100, "ts": now - 1}}), \
+             patch.object(light, "_CODEX_CACHE", {"checked": 0, "sessions": {}, "logs": {}}):
+            assert sid not in light.scan_codex_sessions(now)
+            assert isinstance(json.loads(archived.read_text(encoding="utf-8")), dict)
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(_event("task_started"))
+            assert sid not in light.scan_codex_sessions(now + 4)
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "item_completed", "item": {"type": "UserMessage", "content": []}}}) + "\n")
+            light._CODEX_CACHE["checked"] = 0
+            assert light.scan_codex_sessions(now + 4)[sid]["state"] == "yellow"
+
+            archived.write_text(json.dumps([sid]), encoding="utf-8")
+            light._CODEX_CACHE.update(checked=0, sessions={}, logs={})
+            assert sid not in light.scan_codex_sessions(now + 8)
+
 
 def test_windows_lock_ownership_ignores_closed_handles():
     if sys.platform != "win32":
@@ -244,6 +312,52 @@ def test_windows_lock_ownership_ignores_closed_handles():
             with path.open("rb"):
                 assert light._codex_session_owners(processes)[sid]["pid"] == os.getpid()
             assert light._codex_session_owners(processes) == {}
+
+
+def test_guardian_review_detection_uses_internal_type_not_title():
+    assert light._is_codex_guardian_review({"thread_source": "guardian_review"})
+    assert light._is_codex_guardian_review({"source": {"subagent": {"other": "guardian"}}})
+    assert light._is_codex_guardian_review({"source": '{"subagent":{"other":"guardian"}}'})
+    for meta in ({"title": "Guardian review", "source": "cli"},
+                 {"source": {"subagent": {"other": "explorer"}}},
+                 {"source": None}, {"source": {"subagent": "guardian"}}):
+        assert not light._is_codex_guardian_review(meta)
+
+
+def test_guardian_sessions_stay_out_despite_new_machine_messages_and_new_ids():
+    now = time.time()
+    guardian = "11111111-1111-1111-1111-111111111111"
+    recreated = "22222222-2222-2222-2222-222222222222"
+    normal = "33333333-3333-3333-3333-333333333333"
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        logs = root / datetime.fromtimestamp(now).strftime("%Y/%m/%d")
+        logs.mkdir(parents=True)
+        for sid, metadata in [(guardian, {"thread_source": "guardian_review"}),
+                              (recreated, {"source": {"subagent": {"other": "guardian"}}}),
+                              (normal, {"title": "Guardian review", "source": "cli"})]:
+            path = logs / ("rollout-test-" + sid + ".jsonl")
+            path.write_text(json.dumps({"type": "session_meta", "payload": {
+                "id": sid, "cwd": "C:/work", **metadata}}) + "\n" +
+                _event("task_started") + _event("user_message"), encoding="utf-8")
+        archive = root / "archived.json"
+        hidden = {guardian: {"user_offset": 0}}
+        archive.write_text(json.dumps(hidden), encoding="utf-8")
+        with patch.object(light, "CODEX_SESSIONS_DIR", str(root)), \
+             patch.object(light, "CODEX_ARCHIVED_FILE", str(archive)), \
+             patch.object(light, "_codex_process_starts", return_value={100: now - 10}), \
+             patch.object(light, "_codex_process_context", return_value={}), \
+             patch.object(light, "_codex_session_owners", return_value={
+                 sid: {"pid": 100, "ts": now} for sid in (guardian, recreated, normal)}), \
+             patch.object(light, "_CODEX_CACHE", {"checked": 0, "sessions": {}, "logs": {}}):
+            assert set(light.scan_codex_sessions(now)) == {normal}
+            assert json.loads(archive.read_text(encoding="utf-8")) == hidden
+            path = logs / ("rollout-test-" + guardian + ".jsonl")
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(_event("user_message") + _event("task_started"))
+            light._CODEX_CACHE.update(checked=0, sessions={}, logs={})
+            assert set(light.scan_codex_sessions(now + 4)) == {normal}
+            assert json.loads(archive.read_text(encoding="utf-8")) == hidden
 
 
 if __name__ == "__main__":

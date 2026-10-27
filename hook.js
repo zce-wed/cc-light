@@ -82,6 +82,14 @@ if (!sid) {
     process.exit(0);
 }
 
+// A user delete survives heartbeats, approvals, Stop and SessionStart.
+// Only a newly submitted user prompt may restore this session.
+const hiddenFile = path.join(DATA_DIR, 'claude-hidden', safe(sid) + '.json');
+if (fs.existsSync(hiddenFile)) {
+    if (d.hook_event_name !== 'UserPromptSubmit') process.exit(0);
+    try { fs.unlinkSync(hiddenFile); } catch (e) { process.exit(0); }
+}
+
 const cwd = d.cwd || '';
 const base = cwd.replace(/\\/g, '/').replace(/\/$/, '').split('/').pop();
 const name = base || String(sid).slice(0, 8);

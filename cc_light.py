@@ -14,9 +14,11 @@ cc-light —— Claude Code 桌面悬浮交通灯(多会话优先级聚合)
 """
 import sys
 import os
+import re
 import json
 import time
 import math
+from codex_wait import update_rollout as _update_codex_wait, permission_state as _codex_permission_state
 from datetime import datetime
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +54,8 @@ DSH_SCAN_INTERVAL = 2
 DSH_ACTIVE_WINDOW = 3600    # 空闲会话 1h 未更新后不再展示(忙碌中的会话不受限)
 DSH_ARCHIVED_FILE = os.path.join(DATA_DIR, "dsh-archived.json")
 _DSH_CACHE = {"checked": 0, "sessions": {}}
-DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True}    # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
+DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True,   # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
+                  "monitor_claude": True, "monitor_codex": True, "monitor_dsh": True}   # 监测范围(右键可勾选)
 ERROR_LOG = os.path.join(DATA_DIR, "error.log")          # 异常日志(右键「错误日志」查看,复制丢给排查)
 MAX_ERROR_LOG = 200   # 异常日志保留最近 N 条(超 500KB 自动截断)
 ORDER_FILE = os.path.join(DATA_DIR, "order.json")   # 用户拖拽排序的会话顺序 [sid,...]
@@ -318,11 +321,47 @@ def _encode_path(path):
     return "".join(c if c.isalnum() or c in "-_" else "-" for c in (path or ""))
 
 
+def _parse_claude_cmdline(cmdline):
+    """解析 claude.exe 命令行,区分「会话进程」和 Claude Code 自己的内部进程。
+
+    daemon 模式下后台会话是三层进程:
+      claude.exe daemon run ...                                          ← 守护进程,不是会话
+      claude.exe --bg-pty-host \\\\.\\pipe\\... -- claude.exe --session-id X ...  ← PTY 宿主,不是会话
+      claude.exe --session-id X [--fork-session] --resume <jsonl>        ← 真正的会话进程
+    终端里的交互式会话不带 --session-id。把包装进程算进「项目进程数」会让
+    scan_active_jsonl 多补出并不存在的会话(见该函数注释)。
+
+    返回 {"kind": "daemon"|"ptyhost"|"session", "sid": "", "resume_sid": ""}:
+      sid        该进程承载的会话 id(仅 --session-id 进程)
+      resume_sid --resume 指向的源会话 id —— 它是被 fork 的旧会话,没有自己的进程
+    """
+    text = cmdline or ""
+    low = text.lower()
+    out = {"kind": "session", "sid": "", "resume_sid": ""}
+    if re.search(r"\bdaemon\s+run\b", low):
+        out["kind"] = "daemon"
+    elif "--bg-pty-host" in low:
+        out["kind"] = "ptyhost"
+    m = re.search(r"--session-id[\s=]+([0-9a-f]{8}-[0-9a-f-]{4,})", low)
+    if m:
+        out["sid"] = m.group(1)
+    m = re.search(r'--resume[\s=]+(?:"([^"]+)"|(\S+))', text)
+    if m:
+        leaf = (m.group(1) or m.group(2) or "").replace("\\", "/").rsplit("/", 1)[-1]
+        if leaf.endswith(".jsonl"):
+            leaf = leaf[:-6]
+        if re.match(r"^[0-9a-f]{8}-[0-9a-f-]{4,}$", leaf.lower()):
+            out["resume_sid"] = leaf.lower()
+    return out
+
+
 def _claude_procs():
-    """所有 claude.exe 进程:返回 [{cwd, pid, termpid}, ...]。
+    """所有 claude.exe 进程:返回 [{cwd, pid, termpid, cmdline, start, kind, sid, resume_sid}, ...]。
     cwd=进程工作目录(会话项目目录,精确判活);termpid=父进程 PID(终端 shell —— PowerShell/
-    WindowsTerminal 等,点击切换时 focus 它的窗口)。用 ctypes NtQueryInformationProcess 读 PEB
-    (ProcessBasicInformation 里 InheritedFromUniqueProcessId 即父 PID,纯 ctypes 无依赖)。读失败返回空列表。"""
+    WindowsTerminal 等,点击切换时 focus 它的窗口);start=进程启动时间(Unix 秒)。
+    kind/sid/resume_sid 见 _parse_claude_cmdline。用 ctypes NtQueryInformationProcess 读 PEB
+    (ProcessBasicInformation 里 InheritedFromUniqueProcessId 即父 PID,纯 ctypes 无依赖)。
+    读失败返回空列表。"""
     out = []
     try:
         import ctypes
@@ -343,10 +382,31 @@ def _claude_procs():
             _fields_ = [("r1", ctypes.c_void_p), ("peb", ctypes.c_void_p),
                         ("r2", ctypes.c_void_p * 2), ("pid", ctypes.c_void_p), ("r3", ctypes.c_void_p)]
 
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("lo", wintypes.DWORD), ("hi", wintypes.DWORD)]
+
+        k.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(FILETIME),
+                                      ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                                      ctypes.POINTER(FILETIME)]
+        k.GetProcessTimes.restype = wintypes.BOOL
+
+        def _read_unicode(h, addr):
+            """读 PEB ProcessParameters 里的 UNICODE_STRING(Length@addr, Buffer@addr+8)。"""
+            length = ctypes.c_ushort(); bufptr = ctypes.c_void_p(); rl = ctypes.c_size_t()
+            k.ReadProcessMemory(h, ctypes.c_void_p(addr), ctypes.byref(length), 2, ctypes.byref(rl))
+            k.ReadProcessMemory(h, ctypes.c_void_p(addr + 8), ctypes.byref(bufptr),
+                                ctypes.sizeof(bufptr), ctypes.byref(rl))
+            if not bufptr.value or length.value < 2:
+                return ""
+            buf = ctypes.create_unicode_buffer(length.value // 2 + 1)
+            if not k.ReadProcessMemory(h, bufptr, buf, length.value, ctypes.byref(rl)):
+                return ""
+            return buf.value
+
         arr = (DWORD * 4096)()
         ret = DWORD()
         if not psapi.EnumProcesses(ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(ret)):
-            return cnt
+            return out
         for i in range(ret.value):
             pid = arr[i]
             if pid == 0:
@@ -374,17 +434,22 @@ def _claude_procs():
                 pp = ctypes.c_void_p(); rl = ctypes.c_size_t()
                 if not k.ReadProcessMemory(h2, ctypes.c_void_p(peb + 0x20), ctypes.byref(pp), ctypes.sizeof(pp), ctypes.byref(rl)):
                     continue
-                length = ctypes.c_ushort(); bufptr = ctypes.c_void_p()
-                k.ReadProcessMemory(h2, ctypes.c_void_p(pp.value + 0x38), ctypes.byref(length), 2, ctypes.byref(rl))
-                k.ReadProcessMemory(h2, ctypes.c_void_p(pp.value + 0x40), ctypes.byref(bufptr), ctypes.sizeof(bufptr), ctypes.byref(rl))
-                if not bufptr.value or length.value < 2:
+                # x64 RTL_USER_PROCESS_PARAMETERS:CurrentDirectory.DosPath@0x38,CommandLine@0x70
+                cwd = _read_unicode(h2, pp.value + 0x38).rstrip("\\/").lower()
+                if not cwd:
                     continue
-                buf = ctypes.create_unicode_buffer(length.value // 2 + 1)
-                if not k.ReadProcessMemory(h2, bufptr, buf, length.value, ctypes.byref(rl)):
-                    continue
-                cwd = buf.value.rstrip("\\/").lower()
-                if cwd:
-                    out.append({"cwd": cwd, "pid": pid, "termpid": pbi.r3 or 0})
+                cmdline = _read_unicode(h2, pp.value + 0x70)
+                start = 0.0
+                try:
+                    ctime, etime, ktime, utime = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+                    if k.GetProcessTimes(h2, ctypes.byref(ctime), ctypes.byref(etime),
+                                         ctypes.byref(ktime), ctypes.byref(utime)):
+                        start = ((ctime.hi << 32) | ctime.lo) / 1e7 - 11644473600.0
+                except Exception:
+                    pass
+                info = _parse_claude_cmdline(cmdline)
+                out.append({"cwd": cwd, "pid": pid, "termpid": pbi.r3 or 0,
+                            "cmdline": cmdline, "start": start, **info})
             except Exception:
                 pass
             finally:
@@ -397,15 +462,27 @@ def _claude_procs():
 def scan_active_jsonl(threshold_sec):
     """扫 ~/.claude/projects/<proj>/<sid>.jsonl,只保留【当前有 claude.exe 进程在跑】的项目
     (按进程 cwd 精确判活 —— 没进程的项目即已关,不补,避免误补刚关的旧会话)。同项目按其
-    claude 进程数取最新 N 个 jsonl(PM 开 2 个就取 2 个)。返回 {sid: {"name", "mtime", "termpid"}},
-    termpid 取该会话对应终端 shell 的 PID(补建的 scanned 会话用它点击切换)。"""
+    终端会话进程数取最新 N 个 jsonl(PM 开 2 个就取 2 个)。返回 {sid: {"name", "mtime", "termpid"}},
+    termpid 取该会话对应终端 shell 的 PID(补建的 scanned 会话用它点击切换)。
+
+    两个必须排除的假活跃文件(否则每次重启都多出一个与终端会话同名、点了跳错窗口的幽灵项):
+      1. Claude Code daemon 的 --bg-pty-host 包装进程 / daemon 进程 —— 它们不是会话,
+         计入进程数会让 N 虚高,把更早的 jsonl 也补出来;
+      2. --resume 的源 jsonl —— fork-session 时会刷新它的 mtime,但该会话没有自己的进程。"""
     base = os.path.join(os.environ.get("USERPROFILE") or DIR, ".claude", "projects")
-    procs = _claude_procs()                       # [{cwd, pid, termpid}]
-    proj_terms = {}                               # 编码项目目录(小写) -> [termpid, ...]
+    procs = _claude_procs()
+    # 有 --session-id 的进程 = daemon 里跑的后台会话(无终端窗口),不参与补建:
+    # 它们的 session 文件由 hook 正常维护;按 cwd 计数只会虚增 N。
+    session_procs = [p for p in procs if p.get("kind") == "session"]
+    known_sids = {p["sid"] for p in session_procs if p.get("sid")}
+    resume_sids = {p["resume_sid"] for p in session_procs if p.get("resume_sid")}
+    proj_terms = {}                               # 编码项目目录(小写) -> [proc, ...]
     proj_leaf = {}                                # 同 -> 项目目录 basename(找 Trae/VSCode 宿主窗口用)
-    for p in procs:
+    for p in session_procs:
+        if p.get("sid"):
+            continue                              # 后台会话(daemon 里 --session-id 运行)无终端窗口
         enc = _encode_path(p["cwd"]).lower()
-        proj_terms.setdefault(enc, []).append(p["termpid"])
+        proj_terms.setdefault(enc, []).append(p)
         proj_leaf[enc] = p["cwd"].rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
     out = {}
     now = time.time()
@@ -416,19 +493,24 @@ def scan_active_jsonl(threshold_sec):
     for proj in projects:
         pl = proj.lower()
         terms = proj_terms.get(pl)
-        if not terms:                             # 该项目无活 claude 进程 → 跳过
+        if not terms:                             # 该项目无活终端会话进程 → 跳过
             continue
         # 宿主窗口:优先沿 termpid 父链找(termpid=powershell 无窗口,窗口在祖父 WT/Trae 主进程;
         # WT 多 tab 标题随前台 tab 变、记录的 hwnd 易失效,按进程归属更稳)。找不到再按 basename 匹配标题。
-        host_hwnd = (find_window_by_pid(terms[0]) if terms else None) or find_window_by_name(proj_leaf.get(pl, ""))
+        host_hwnd = find_window_by_pid(terms[0]["termpid"]) or find_window_by_name(proj_leaf.get(pl, ""))
         pdir = os.path.join(base, proj)
         if not os.path.isdir(pdir):
             continue
+        # 会话进程启动之前写入的 jsonl 不可能是它的;--resume 的源文件正是这种。
+        earliest = min((p.get("start") or 0) for p in terms) or 0
         cands = []
         try:
             for fn in os.listdir(pdir):
                 if not fn.endswith(".jsonl"):
                     continue
+                sid = fn[:-6]
+                if sid in known_sids or sid in resume_sids:
+                    continue                      # 后台会话 / 被 resume 的旧会话,没有自己的终端进程
                 path = os.path.join(pdir, fn)
                 try:
                     mtime = os.path.getmtime(path)
@@ -436,23 +518,32 @@ def scan_active_jsonl(threshold_sec):
                     continue
                 if now - mtime > threshold_sec:
                     continue
-                cands.append((mtime, fn[:-6]))
+                if earliest and mtime < earliest - 5:   # 5s 容差:文件创建与进程启动同一秒
+                    continue
+                cands.append((mtime, sid))
         except OSError:
             continue
         cands.sort(reverse=True)                  # 最新在前
         n = len(terms)
-        for idx, (mtime, sid) in enumerate(cands[:n]):   # 取最新 n 个(= 进程数)
+        for idx, (mtime, sid) in enumerate(cands[:n]):   # 取最新 n 个(= 终端进程数)
             # name 用 basename(cwd 末段,如 zcvip-front),与 hook 写的 name、_jump 兜底匹配的窗口标题
             # (file - zcvip-front - Trae CN 只含 basename)三方一致。曾用 proj_name(含父目录,如
             # Desktop-newWork-zcvip-front):匹配不了标题,hwnd 失效后 _jump 兜底全失败 → 跳不动。
             out[sid] = {"name": proj_leaf.get(pl, "") or proj_name(proj), "mtime": mtime,
-                        "termpid": terms[idx % n],         # round-robin 终端 pid(独立终端窗口场景;同项目多终端无法 1:1 精确)
+                        "termpid": terms[idx % n]["termpid"],   # round-robin 终端 pid(独立终端窗口场景;同项目多终端无法 1:1 精确)
                         "hwnd": host_hwnd or 0,            # 宿主窗口(Trae/VSCode:同项目会话共享一个,点击 focus 它)
                         "jsonl": os.path.join(pdir, sid + ".jsonl")}  # scanned 会话按其 mtime 判忙/闲
     return out
 
 
+def _claude_hidden_file(sid):
+    safe = "".join(c for c in sid if c.isalnum() or c in ("_", "-")) or "unknown"
+    return os.path.join(DATA_DIR, "claude-hidden", safe + ".json")
+
+
 def _write_session_file(sid, d):
+    if os.path.exists(_claude_hidden_file(sid)):
+        return
     """写 session 文件(灯窗口单线程,普通写即可)。"""
     safe = "".join(c for c in sid if c.isalnum() or c in ("_", "-")) or "unknown"
     path = os.path.join(SESSIONS_DIR, safe + ".json")
@@ -464,9 +555,14 @@ def _write_session_file(sid, d):
         pass
 
 
-def archive_session(sid):
+def archive_session(sid, user_hidden=False):
     """把会话移到归档(不真删),供「检测所有会话」还原。会话真正结束(--end)走 delete_session。"""
     safe = "".join(c for c in sid if c.isalnum() or c in ("_", "-")) or "unknown"
+    if user_hidden:
+        marker = _claude_hidden_file(sid)
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as stream:
+            json.dump({"hidden": True}, stream)
     src = os.path.join(SESSIONS_DIR, safe + ".json")
     if not os.path.exists(src):
         return
@@ -512,22 +608,62 @@ def _archive_scanned_session(path, sid):
 
 
 def _read_codex_archived():
-    """Return Codex sessions hidden from the cc-light list by the user."""
-    return _read_archived_ids(CODEX_ARCHIVED_FILE)
+    """Return hidden ids and user-message cursors; legacy values need a baseline."""
+    try:
+        with open(CODEX_ARCHIVED_FILE, encoding="utf-8") as stream:
+            value = json.load(stream)
+        if isinstance(value, dict):
+            return {sid: offset for sid, offset in value.items()
+                    if isinstance(sid, str) and
+                    (offset is None or type(offset) is int and offset >= 0 or
+                     isinstance(offset, dict) and type(offset.get("user_offset")) is int
+                     and offset["user_offset"] >= 0)}
+        if isinstance(value, list):
+            return {sid: None for sid in value if isinstance(sid, str)}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def _write_codex_archived(archived, path=None):
+    path = path or CODEX_ARCHIVED_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as stream:
+            json.dump(archived, stream)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(archived, stream)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def archive_codex_session(sid):
-    """Hide a dynamically scanned Codex session without touching its rollout log."""
-    _archive_scanned_session(CODEX_ARCHIVED_FILE, sid)
+    """Hide until the next user message, including while the current turn runs."""
+    session = _CODEX_CACHE["sessions"].get(sid, {})
+    path = session.get("jsonl")
+    entry = _CODEX_CACHE["logs"].setdefault(path, {}) if path else {}
+    if path:
+        _codex_log_state(path, entry)
+    archived = _read_codex_archived()
+    archived[sid] = {"user_offset": entry.get("user_offset", 0)}
+    _write_codex_archived(archived)
 
 
 def _read_dsh_archived():
-    """Sessions hidden by the user: cc-light's own list plus the app's archive.
+    """App sidebar archives; cc-light's user-message markers are handled separately.
 
     The desktop app records archived sessions in ``workspace.json``; those are
     no longer shown in its sidebar, so they must not appear in the light either.
     """
-    archived = _read_archived_ids(DSH_ARCHIVED_FILE)
+    archived = set()
     try:
         with open(DSH_WORKSPACE_FILE, "r", encoding="utf-8") as f:
             workspace = json.load(f)
@@ -540,8 +676,30 @@ def _read_dsh_archived():
 
 
 def archive_dsh_session(sid):
-    """Hide a DeepSeek Harness session; its own checkpoint stays untouched."""
-    _archive_scanned_session(DSH_ARCHIVED_FILE, sid)
+    """Hide until lastPromptAt changes, regardless of background activity."""
+    hidden = _read_dsh_hidden()
+    hidden[sid] = None
+    try:
+        with open(os.path.join(DSH_PROJ_CACHE_DIR, sid + ".json"), encoding="utf-8") as stream:
+            rows = json.load(stream)["record"]["rows"]
+        hidden[sid] = {"last_prompt_at": (_dsh_row(rows, "sessionListMetadata") or {}).get("lastPromptAt")}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    _write_codex_archived(hidden, DSH_ARCHIVED_FILE)
+
+
+def _read_dsh_hidden():
+    try:
+        with open(DSH_ARCHIVED_FILE, encoding="utf-8") as stream:
+            value = json.load(stream)
+        if isinstance(value, list):
+            return {sid: None for sid in value if isinstance(sid, str)}
+        if isinstance(value, dict):
+            return {sid: marker for sid, marker in value.items()
+                    if isinstance(sid, str) and (marker is None or isinstance(marker, dict))}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
 
 
 def remove_inactive_scanned_sessions(active):
@@ -560,6 +718,8 @@ def remove_inactive_scanned_sessions(active):
             continue
         sid = fn[:-5]
         path = os.path.join(SESSIONS_DIR, fn)
+        if os.path.exists(_claude_hidden_file(fn[:-5])):
+            continue
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -810,16 +970,24 @@ def _codex_log_state(path, cache):
                 if not line or not line.endswith(b"\n"):
                     break
                 cache["offset"] = stream.tell()
-                if not any(marker in line for marker in (b'"task_started"', b'"task_complete"', b'"turn_aborted"')):
-                    continue
                 try:
                     event = json.loads(line)
                 except ValueError:
                     continue
+                _update_codex_wait(event, cache)
+                payload = event.get("payload", {})
+                if ((event.get("type") == "response_item" and payload.get("type") == "message"
+                     and payload.get("role") == "user") or
+                    (event.get("type") == "event_msg" and
+                     (payload.get("type") == "user_message" or
+                      payload.get("type") == "item_completed" and
+                      payload.get("item", {}).get("type") == "UserMessage"))):
+                    cache["user_offset"] = cache["offset"]
                 if event.get("type") == "event_msg":
                     kind = event.get("payload", {}).get("type")
                     if kind in ("task_started", "task_complete", "turn_aborted"):
-                        cache["state"] = "yellow" if kind == "task_started" else "green"
+                        if kind == "task_started":
+                            cache["turn_offset"] = cache["offset"]
     except (OSError, ValueError, TypeError):
         return None
     return cache.get("meta")
@@ -858,6 +1026,20 @@ def _codex_terminal_pid(sid, owner, cwd, processes, contexts):
     return min(candidates, key=lambda p: abs(owner.get("ts", 0) - processes[p]))
 
 
+def _is_codex_guardian_review(meta):
+    """Guardian receives machine-authored user messages; it is not a user chat."""
+    if meta.get("thread_source") == "guardian_review":
+        return True
+    source = meta.get("source")
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except ValueError:
+            return False
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    return isinstance(subagent, dict) and subagent.get("other") == "guardian"
+
+
 def scan_codex_sessions(now=None):
     """Collect Codex rollouts owned by a currently running codex.exe."""
     now = time.time() if now is None else now
@@ -867,6 +1049,7 @@ def scan_codex_sessions(now=None):
     result = {}
     bindings = _CODEX_CACHE.setdefault("bindings", {})
     archived = _read_codex_archived()
+    archive_changed = False
     if processes:
         owners = _codex_session_owners(processes)
         contexts = {pid: _codex_process_context(pid) for pid in processes}
@@ -896,13 +1079,24 @@ def scan_codex_sessions(now=None):
                         continue
                     entry = _CODEX_CACHE["logs"].setdefault(path, {})
                     meta = _codex_log_state(path, entry)
-                    if not meta:
+                    if not meta or _is_codex_guardian_review(meta):
                         continue
                     sid = meta.get("id") or meta.get("session_id")
                     if not sid:
                         continue
                     if sid in archived:
-                        continue
+                        hidden = archived[sid]
+                        user_offset = entry.get("user_offset", 0)
+                        if not isinstance(hidden, dict):
+                            # Old turn cursors cannot distinguish automatic
+                            # continuations from user messages. Keep them hidden.
+                            archived[sid] = {"user_offset": user_offset}
+                            archive_changed = True
+                            continue
+                        if user_offset <= hidden["user_offset"]:
+                            continue
+                        del archived[sid]
+                        archive_changed = True
                     cwd = meta.get("cwd") or ""
                     # ProjectManager uses ``codex exec --json`` through pipes.
                     # It creates the same rollout/lock records as the TUI but
@@ -933,12 +1127,16 @@ def scan_codex_sessions(now=None):
                             continue
                         _delta, pid = min(matches)
                     name = os.path.basename(cwd.replace("\\", "/").rstrip("/")) or sid[:8]
-                    result[sid] = {"provider": "codex", "state": entry.get("state", "green"),
+                    state = _codex_permission_state(sid, entry, DATA_DIR,
+                        os.path.join(os.path.expanduser("~"), ".codex", "logs_2.sqlite"))
+                    result[sid] = {"provider": "codex", "state": state,
                                    "ts": mtime, "name": name, "termpid": pid,
                                    "jsonl": path, "hwnd": 0, "subs": 0,
                                    "jumpable": not background}
                     if pid:
                         bindings[sid] = (pid, processes.get(pid))
+    if archive_changed:
+        _write_codex_archived(archived)
     for sid in list(bindings):
         if sid not in result:
             bindings.pop(sid, None)
@@ -1055,10 +1253,8 @@ def scan_dsh_sessions(now=None):
     run would keep ghost sessions visible after the app was closed.  Idle
     sessions fade out after ``DSH_ACTIVE_WINDOW``; busy ones never do.
 
-    Archived sessions (cc-light's right-click delete or the app's sidebar
-    archive) stay hidden only while idle.  Once such a session starts another
-    turn it comes back -- otherwise a still-running archived session would
-    silently stop the light from reporting its state.
+    A cc-light delete stays hidden until the user sends another prompt.
+    App sidebar archives retain their separate busy/idle filtering.
     """
     now = time.time() if now is None else now
     if now - _DSH_CACHE["checked"] < DSH_SCAN_INTERVAL:
@@ -1068,6 +1264,8 @@ def scan_dsh_sessions(now=None):
     if processes:
         started = min(processes.values())
         archived = _read_dsh_archived()
+        hidden = _read_dsh_hidden()
+        hidden_changed = False
         try:
             files = os.listdir(DSH_PROJ_CACHE_DIR)
         except OSError:
@@ -1085,13 +1283,27 @@ def scan_dsh_sessions(now=None):
                 continue
             try:
                 with open(path, "r", encoding="utf-8") as stream:
-                    record = (json.load(stream) or {}).get("record") or {}
+                    projection = json.load(stream)
+                    if not isinstance(projection, dict):
+                        continue
+                    record = projection.get("record") or {}
             except (OSError, ValueError):
                 continue
             rows = record.get("rows") or {}
             meta = _dsh_row(rows, "sessionListMetadata") or {}
             if meta.get("blank", True) or not meta.get("lastPromptAt"):
                 continue                    # 从未发过消息的空会话
+            if sid in hidden:
+                marker = hidden[sid]
+                current_prompt = meta.get("lastPromptAt")
+                if marker is None:
+                    hidden[sid] = {"last_prompt_at": current_prompt}
+                    hidden_changed = True
+                    continue
+                if marker.get("last_prompt_at") == current_prompt:
+                    continue
+                del hidden[sid]
+                hidden_changed = True
             state = _dsh_state(rows)
             if sid in archived and state == "green":
                 continue                    # 归档/删除只隐藏空闲会话(重新运行时必须能被看见)
@@ -1117,6 +1329,8 @@ def scan_dsh_sessions(now=None):
                 "window_title": (_dsh_row(rows, "title") or ""),
                 "jumpable": True,
             }
+        if hidden_changed:
+            _write_codex_archived(hidden, DSH_ARCHIVED_FILE)
     _DSH_CACHE.update(checked=now, sessions=result)
     return result
 
@@ -1186,6 +1400,10 @@ def read_sessions(now=None):
     for fn in files:
         if not fn.endswith(".json"):
             continue
+        if not _config.get("monitor_claude", True):
+            continue      # 监测范围关掉 Claude Code:整体跳过(连归档副作用也不做,重新勾选后按原逻辑处理)
+        if os.path.exists(_claude_hidden_file(fn[:-5])):
+            continue
         path = os.path.join(SESSIONS_DIR, fn)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1208,8 +1426,10 @@ def read_sessions(now=None):
             out[fn[:-5]] = d
         except Exception:
             continue
-    out.update(scan_codex_sessions(now))
-    out.update(scan_dsh_sessions(now))
+    if _config.get("monitor_codex", True):
+        out.update(scan_codex_sessions(now))
+    if _config.get("monitor_dsh", True):
+        out.update(scan_dsh_sessions(now))
     return out
 
 
@@ -1418,6 +1638,14 @@ def diag_jump():
         hwnd = d.get("hwnd")
         tp = d.get("termpid")
         kind = "scan" if d.get("scanned") else "hook"
+        # 后台会话(PM 任务 / CC daemon)本来就没有终端窗口,点击走提示而非跳转 ——
+        # 不能报 FAIL 误导排查。
+        bk = background_kind(d)
+        if bk:
+            print("  [BG  ] %s  %-4s name=%r hwnd=%s tp=%s -> %s,无终端窗口(点击提示)"
+                  % (sid[:8], kind, name, hwnd, tp,
+                     "Claude Code 后台会话" if bk == "cc" else "ProjectManager 后台任务"))
+            continue
         # 与 GUI 的 resolve_session_hwnd 一致:父链/控制台映射优先(WT 多窗口靠它才准),
         # 再退回记录的 hwnd/项目名。
         tgt, via = None, ""
@@ -1458,6 +1686,11 @@ def cli():
             log_miss("miss-sid", d)   # CC 偶尔没传 session_id,不写文件避免污染聚合
             return 0
         cwd = d.get("cwd") or ""
+        marker = _claude_hidden_file(sid)
+        if os.path.exists(marker):
+            if d.get("hook_event_name") != "UserPromptSubmit":
+                return 0
+            os.remove(marker)
         name = os.path.basename(cwd.replace("\\", "/").rstrip("/")) or sid[:8]
         write_session(sid, a[1], "", name)
         return 0
@@ -1651,6 +1884,85 @@ def work_area():
         return r.left, r.top, r.right, r.bottom
     except Exception:
         return None
+
+
+def monitor_work_areas():
+    """Enumerate connected monitor work areas, including negative coordinates."""
+    try:
+        import ctypes
+        from ctypes import wintypes as w
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", w.DWORD), ("rcMonitor", w.RECT),
+                        ("rcWork", w.RECT), ("dwFlags", w.DWORD)]
+        user = ctypes.windll.user32
+        user.GetMonitorInfoW.argtypes = [w.HANDLE, ctypes.POINTER(MONITORINFO)]
+        areas = []
+        callback_type = ctypes.WINFUNCTYPE(w.BOOL, w.HANDLE, w.HDC, ctypes.POINTER(w.RECT), w.LPARAM)
+        @callback_type
+        def collect(handle, dc, rect, data):
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if user.GetMonitorInfoW(handle, ctypes.byref(info)):
+                r = info.rcWork
+                areas.append((r.left, r.top, r.right, r.bottom))
+            return True
+        user.EnumDisplayMonitors(None, None, collect, 0)
+        if areas:
+            return areas
+    except Exception:
+        pass
+    area = work_area()
+    return [area] if area else []
+
+
+def visible_position(x, y, width, height, areas):
+    """Keep valid positions; clamp a lost window onto the nearest live monitor."""
+    if not areas:
+        return x, y
+    candidates = []
+    for left, top, right, bottom in areas:
+        nx = min(max(x, left), max(left, right - width))
+        ny = min(max(y, top), max(top, bottom - height))
+        candidates.append(((nx - x) ** 2 + (ny - y) ** 2, nx, ny))
+    _, nx, ny = min(candidates)
+    return nx, ny
+
+
+_GUI_MUTEX = None
+
+
+def _acquire_gui_instance():
+    global _GUI_MUTEX
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    import hashlib
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
+    kernel.CreateMutexW.restype = w.HANDLE
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    suffix = hashlib.sha256(os.path.normcase(DATA_DIR).encode("utf-8")).hexdigest()[:16]
+    handle = kernel.CreateMutexW(None, False, "Local\\cc-light-gui-" + suffix)
+    error = ctypes.get_last_error()
+    if not handle:
+        raise ctypes.WinError(error)
+    if error == 183:  # ERROR_ALREADY_EXISTS: another light is already running.
+        kernel.CloseHandle(handle)
+        return False
+    _GUI_MUTEX = handle
+    return True
+
+
+def _release_gui_instance():
+    global _GUI_MUTEX
+    if _GUI_MUTEX is not None:
+        import ctypes
+        from ctypes import wintypes as w
+        kernel = ctypes.windll.kernel32
+        kernel.CloseHandle.argtypes = [w.HANDLE]
+        kernel.CloseHandle(_GUI_MUTEX)
+        _GUI_MUTEX = None
 
 
 def focus_window(hwnd):
@@ -2290,26 +2602,37 @@ def _is_terminal_session(termpid):
     return any(_process_image_name(p) in _SHELL_EXES for p in chain[:4])
 
 
-def is_background_task(d):
-    """是否 ProjectManager 后台任务(没有终端窗口可跳)。
+def background_kind(d):
+    """后台会话类型:"" = 终端会话,"pm" = ProjectManager 后台任务,"cc" = Claude Code 后台会话。
 
-    - 管理页 -p 无头任务:后端代写 session,scanned=true 且 hwnd/termpid 恒 0;
+    - PM 管理页 -p 无头任务:后端代写 session,scanned=true 且 hwnd/termpid 恒 0;
     - PM agent-server/Copilot spawn 的会话:hook 正常写,但 termpid 是后端 node 进程,
-      父链没有终端 shell/控制台窗口(CC_LIGHT_BG 只标记 -p 无头任务,覆盖不到这类)。
-    这类会话点击时应提示用户自行去管理页查看,不能按项目名兜底 —— 会误跳同名终端窗口。
+      父链没有终端 shell/控制台窗口(CC_LIGHT_BG 只标记 -p 无头任务,覆盖不到这类);
+    - CC daemon 的后台会话:hook 正常写,termpid 是 daemon 的 --bg-pty-host 进程
+      (claude.exe),父链同样没有终端。它和 PM 任务一样没有窗口可跳,但查看方式不同
+      (不是去 ProjectManager 管理页),提示文案必须分开。
     注意「检测所有会话」补建的 scanned 终端会话也是 scanned,但 termpid 来自活 shell,
     _is_terminal_session 会放行。
     """
     if not d:
-        return False
+        return ""
     if d.get("bg"):
-        return True
+        return "pm"
     if bool(d.get("scanned")) and not d.get("hwnd") and not d.get("termpid"):
-        return True
+        return "pm"
     tp = d.get("termpid")
     if not tp or not is_process_alive(tp):
-        return False
-    return not _is_terminal_session(tp)
+        return ""
+    # termpid 本身是 claude.exe → daemon 的 bg-pty-host(CC 后台会话)。
+    # 终端会话的 termpid 是 shell(cmd/powershell/bash),不会是 claude。
+    if _process_image_name(tp) == "claude.exe":
+        return "cc"
+    return "" if _is_terminal_session(tp) else "pm"
+
+
+def is_background_task(d):
+    """是否没有终端窗口可跳(PM 后台任务或 CC daemon 后台会话)。"""
+    return bool(background_kind(d))
 
 
 def write_focus_file(sid, name):
@@ -2386,6 +2709,15 @@ def round_rect(cv, x0, y0, x1, y1, r, **kw):
 
 # ---------------- GUI ----------------
 def run_gui():
+    if not _acquire_gui_instance():
+        return 0
+    try:
+        return _run_gui()
+    finally:
+        _release_gui_instance()
+
+
+def _run_gui():
     import tkinter as tk
     set_dpi_aware()
     set_app_user_model_id("cc-light.NotePad")   # 独立 AppID:任务栏按它缓存图标,不再沿用 pythonw 的 python 图标
@@ -2501,7 +2833,11 @@ def run_gui():
     try:
         with open(POS_FILE, "r", encoding="utf-8") as f:
             p = json.load(f)
-        root.geometry("%dx%d+%d+%d" % (W, H, int(p["x"]), int(p["y"])))
+        x, y = visible_position(int(p["x"]), int(p["y"]), W, H, monitor_work_areas())
+        root.geometry("%dx%d+%d+%d" % (W, H, x, y))
+        if (x, y) != (int(p["x"]), int(p["y"])):
+            with open(POS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"x": x, "y": y}, f)
     except Exception:
         root.geometry(default_geo())
 
@@ -2735,9 +3071,16 @@ def run_gui():
                         log_error(None, "DeepSeek 跳转失败: sid=%s name=%r"
                                   % (sid[:8], _nm))
                     break
-                # ProjectManager 后台无头任务(CC_LIGHT_BG=1):没有终端窗口可跳。不自动打开
-                # 浏览器,只在灯窗口提示用户自行去管理页查看;焦点文件照写(已开着的页面自动切项目)。
-                if is_background_task(sessions.get(sid, {})):
+                # 后台会话没有终端窗口可跳。PM 任务(CC_LIGHT_BG / agent-server spawn)提示去
+                # 管理页;CC daemon 的后台会话不是 PM 任务,提示去 Claude Code 里查看。
+                _bk = background_kind(sessions.get(sid, {}))
+                if _bk == "cc":
+                    log_error(None, "跳转 Claude Code 后台会话(无终端窗口): sid=%s name=%r"
+                              % (sid[:8], _nm))
+                    show_notice("「%s」在 Claude Code 后台运行\n"
+                                "没有终端窗口，无法切换" % _nm)
+                    break
+                if _bk == "pm":
                     log_error(None, "跳转后台任务(提示去管理页): sid=%s name=%r"
                               % (sid[:8], _nm))
                     write_focus_file(sid, _nm)
@@ -2825,6 +3168,10 @@ def run_gui():
                 name = "Codex · " + name
             elif d.get("provider") == "dsh":
                 name = "DeepSeek · " + name
+            elif background_kind(d) == "cc":
+                # CC daemon 后台会话没有终端窗口,与同项目的终端会话同名 —— 加标记区分,
+                # 否则明细里看起来就是「多出一个一模一样的项目」。
+                name = name + " ·后台"
             multi = names.count(d.get("name", "")) > 1
             hwnd = d.get("hwnd")
             termpid = d.get("termpid")
@@ -2869,7 +3216,7 @@ def run_gui():
                         _DSH_CACHE["checked"] = 0
                         _DSH_CACHE["sessions"].pop(s, None)
                     else:
-                        archive_session(s)
+                        archive_session(s, user_hidden=True)
                     close_details()
                     root.after(20, details_hover)
                 m.add_command(label="删除该会话", command=_do)
@@ -2953,8 +3300,9 @@ def run_gui():
         render_dots(sessions, time.time())
 
     def restore_sessions():
-        _CODEX_CACHE["checked"] = 0
-        scan_codex_sessions(time.time())
+        if _config.get("monitor_codex", True):   # 监测范围关掉 Codex 时不扫(下面 read_sessions 也会过滤)
+            _CODEX_CACHE["checked"] = 0
+            scan_codex_sessions(time.time())
         """「检测所有会话」:
         扫 ~/.claude/projects 下 SCAN_ACTIVE 内的 jsonl,只保留【有 claude.exe 进程在跑】
         的项目(scan_active_jsonl 按进程 cwd 判活 —— 已关的不会误补),补建 sessions 里缺失的
@@ -3006,6 +3354,8 @@ def run_gui():
             if not fn.endswith(".json"):
                 continue
             sid = fn[:-5]
+            if os.path.exists(_claude_hidden_file(sid)):
+                continue
             src = os.path.join(ARCHIVE_DIR, fn)
             dst = os.path.join(SESSIONS_DIR, fn)
             if os.path.exists(dst):              # 列表已有(活跃),归档副本作废
@@ -3047,6 +3397,27 @@ def run_gui():
     timeout_menu = tk.Menu(root, tearoff=0)
     for sec in (30, 60, 120, 180, 300, 600):
         timeout_menu.add_radiobutton(label="%d 秒" % sec, value=sec, variable=timeout_var, command=on_set_timeout)
+
+    # 监测范围(右键「其他设置」→「监测范围」勾选):关掉某类 → read_sessions 不再统计它,
+    # 灯和圆点立刻少掉;比如不想被 Codex 会话影响时取消勾选 Codex 即可。
+    monitor_vars = {
+        "claude": tk.IntVar(value=1 if _config.get("monitor_claude", True) else 0),
+        "codex": tk.IntVar(value=1 if _config.get("monitor_codex", True) else 0),
+        "dsh": tk.IntVar(value=1 if _config.get("monitor_dsh", True) else 0),
+    }
+
+    def on_toggle_monitor(key):
+        _config["monitor_" + key] = bool(monitor_vars[key].get())
+        save_config()
+        sessions = read_sessions()
+        c, n = aggregate(sessions)
+        apply(c)
+        render_dots(sessions, time.time())
+
+    monitor_menu = tk.Menu(root, tearoff=0)
+    for key, label in (("claude", "Claude Code"), ("codex", "Codex"), ("dsh", "DeepSeek Harness")):
+        monitor_menu.add_checkbutton(label=label, variable=monitor_vars[key],
+                                     command=lambda k=key: on_toggle_monitor(k))
 
     topmost_var = tk.IntVar(value=1)   # 灯窗口默认置顶(原双击切换,易误触 → 改菜单)
 
@@ -3809,6 +4180,12 @@ def run_gui():
         txt.insert("1.0", _all_text())
         txt.configure(state="disabled")
 
+    # 「其他设置」二级菜单:超时兜底 / 超时时间 / 监测范围(可勾选,关掉某类会话不再统计)
+    other_menu = tk.Menu(root, tearoff=0)
+    other_menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
+    other_menu.add_cascade(label="超时时间", menu=timeout_menu)
+    other_menu.add_cascade(label="监测范围", menu=monitor_menu)
+
     menu = tk.Menu(root, tearoff=0)
     menu.add_command(label="清理不活跃会话", command=cleanup_stale)
     menu.add_command(label="检测所有会话", command=restore_sessions)   # 还原被清理/删除的会话
@@ -3817,15 +4194,15 @@ def run_gui():
     menu.add_command(label="快捷记录", command=toggle_note)
     menu.add_command(label="快捷指令", command=show_snippets)
     menu.add_separator()
-    menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
-    menu.add_cascade(label="超时时间", menu=timeout_menu)
+    menu.add_cascade(label="其他设置", menu=other_menu)
     def restart():
         import subprocess
+        root.destroy()
+        _release_gui_instance()
         try:
             subprocess.Popen([sys.executable, os.path.abspath(__file__)])
         except Exception:
             pass
-        root.destroy()
 
     def restore_statusline():
         """把 claude-hud 的 statusLine 写回 ~/.claude/settings.json —— 一键恢复上下文栏。

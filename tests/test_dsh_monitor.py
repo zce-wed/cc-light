@@ -159,3 +159,34 @@ def test_dsh_sessions_join_read_sessions():
             sessions = light.read_sessions(now)
         assert sessions["session-live"]["provider"] == "dsh"
         assert light.aggregate(sessions)[0] == "yellow"
+
+
+def test_local_delete_survives_busy_updates_restart_and_completion_until_new_prompt():
+    now = time.time()
+    sid = "deleted"
+    with tempfile.TemporaryDirectory() as folder:
+        cache = Path(folder)
+        _write(cache, sid, _record(sid, "C:/work/demo", last_prompt_at=1, open_turn=1))
+        assert sid in _scan(cache, now)
+        with patch.object(light, "DSH_PROJ_CACHE_DIR", folder), \
+             patch.object(light, "DSH_ARCHIVED_FILE", str(cache / "archived.json")):
+            light.archive_dsh_session(sid)
+        assert sid not in _scan(cache, now + 3)
+        _write(cache, sid, _record(sid, "C:/work/demo", last_prompt_at=1, active_questions=[{"callId": "q"}]))
+        assert sid not in _scan(cache, now + 6)
+        _write(cache, sid, _record(sid, "C:/work/demo", last_prompt_at=1))
+        assert sid not in _scan(cache, now + 9)
+        _write(cache, sid, _record(sid, "C:/work/demo", last_prompt_at=2))
+        assert sid in _scan(cache, now + 12)
+        assert sid in _scan(cache, now + 15)
+
+
+def test_legacy_local_dsh_hide_does_not_restore_a_running_session():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as folder:
+        cache = Path(folder)
+        (cache / "archived.json").write_text(json.dumps(["deleted"]), encoding="utf-8")
+        _write(cache, "deleted", _record("deleted", "C:/work/demo", last_prompt_at=1, open_turn=1))
+        assert "deleted" not in _scan(cache, now)
+        _write(cache, "deleted", _record("deleted", "C:/work/demo", last_prompt_at=2, open_turn=2))
+        assert "deleted" in _scan(cache, now + 3)
