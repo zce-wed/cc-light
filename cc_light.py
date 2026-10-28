@@ -1040,6 +1040,45 @@ def _is_codex_guardian_review(meta):
     return isinstance(subagent, dict) and subagent.get("other") == "guardian"
 
 
+def _codex_subagent_parent(meta):
+    """Return a worker's parent without collapsing ordinary forked user chats."""
+    source = meta.get("source")
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except ValueError:
+            source = None
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    if meta.get("thread_source") == "subagent" or isinstance(spawn, dict):
+        parent = meta.get("parent_thread_id") or (spawn or {}).get("parent_thread_id")
+        return parent if isinstance(parent, str) else None
+    return None
+
+
+def _fold_codex_subagents(sessions, parents):
+    """Display only user chats; workers contribute state to their visible root."""
+    result = {sid: dict(row) for sid, row in sessions.items() if not parents.get(sid)}
+    for sid, row in sessions.items():
+        if not parents.get(sid):
+            continue
+        root = sid
+        seen = set()
+        while parents.get(root) and root not in seen:
+            seen.add(root)
+            root = parents[root]
+        if root in seen or root not in result:
+            continue  # Hidden/closed parent stays hidden, including after restart.
+        target = result[root]
+        state = row.get("state", "green")
+        if state in ("red", "yellow"):
+            target["subs"] = target.get("subs", 0) + 1
+            target["ts"] = max(target.get("ts", 0), row.get("ts", 0))
+        if PRIO.get(state, 99) < PRIO.get(target.get("state"), 99):
+            target["state"] = state
+    return result
+
+
 def scan_codex_sessions(now=None):
     """Collect Codex rollouts owned by a currently running codex.exe."""
     now = time.time() if now is None else now
@@ -1047,6 +1086,7 @@ def scan_codex_sessions(now=None):
         return _CODEX_CACHE["sessions"]
     processes = _codex_process_starts()
     result = {}
+    parents = {}
     bindings = _CODEX_CACHE.setdefault("bindings", {})
     archived = _read_codex_archived()
     archive_changed = False
@@ -1089,7 +1129,10 @@ def scan_codex_sessions(now=None):
                     sid = meta.get("id") or meta.get("session_id")
                     if not sid:
                         continue
-                    if sid in archived:
+                    parent = _codex_subagent_parent(meta)
+                    if parent:
+                        parents[sid] = parent
+                    if sid in archived and not parent:
                         hidden = archived[sid]
                         user_offset = entry.get("user_offset", 0)
                         if not isinstance(hidden, dict):
@@ -1142,6 +1185,7 @@ def scan_codex_sessions(now=None):
                         bindings[sid] = (pid, processes.get(pid))
     if archive_changed:
         _write_codex_archived(archived)
+    result = _fold_codex_subagents(result, parents)
     for sid in list(bindings):
         if sid not in result:
             bindings.pop(sid, None)

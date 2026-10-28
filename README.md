@@ -29,6 +29,8 @@ DeepSeek Harness 同样无需 hook:灯窗口每 2 秒读取桌面版实时写入
 
 Codex 的内部 `Guardian review` 审批复核会话不显示在列表中:按 `thread_source=guardian_review` 或 `source.subagent.other=guardian` 过滤,系统自动发送的复核消息不会使其重新出现;同名的普通聊天不受影响。
 
+Codex 子代理折叠到所属主会话,不再各自显示同名项目条目。子代理运行或等待确认时,其状态按红灯优先于黄灯的规则计入主会话;删除主会话后,子代理活动不会将它恢复。同项目的独立用户会话仍分别显示。
+
 ## 多会话聚合
 
 每个 CC 窗口一个 session 文件(`sessions/<session_id>.json`),灯窗口 500ms 轮询、按优先级聚合:
