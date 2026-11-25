@@ -2786,6 +2786,34 @@ def round_rect(cv, x0, y0, x1, y1, r, **kw):
 
 
 # ---------------- GUI ----------------
+def read_memory_percent():
+    """Read system-wide physical RAM usage with Windows' native API."""
+    try:
+        import ctypes
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(status)
+        query = ctypes.windll.kernel32.GlobalMemoryStatusEx
+        query.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
+        query.restype = ctypes.c_int
+        if query(ctypes.byref(status)) and 0 <= status.dwMemoryLoad <= 100:
+            return int(status.dwMemoryLoad)
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def memory_display(percent):
+    if percent is None:
+        return "--%", "#777777"
+    return "%d%%" % percent, COLORS["red"]["on"] if percent > 90 else "#ededed"
+
+
 def run_gui():
     if not _acquire_gui_instance():
         return 0
@@ -2800,7 +2828,7 @@ def _run_gui():
     set_dpi_aware()
     set_app_user_model_id("cc-light.NotePad")   # 独立 AppID:任务栏按它缓存图标,不再沿用 pythonw 的 python 图标
 
-    W, H = 52, 150
+    W, H = 52, 174
     R_LAMP = 12
     R_GLOW = 16
     cx = W // 2
@@ -2935,6 +2963,15 @@ def _run_gui():
         lamps[key] = {"base": base, "glow": glow, "hi": hi}
 
     dots = []   # 横排小点 item ids(每个会话一个,颜色=该会话有效状态)
+    memory_text = cv.create_text(cx, 153, text="--%", fill="#777777",
+                                 font=("Consolas", 12, "bold"), tags="memory")
+
+    def refresh_memory():
+        text, color = memory_display(read_memory_percent())
+        cv.itemconfig(memory_text, text=text, fill=color)
+        root.after(1000, refresh_memory)
+
+    refresh_memory()
 
     cur = {"s": None, "pulse": False}
 
