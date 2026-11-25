@@ -2829,13 +2829,12 @@ def _run_gui():
     set_dpi_aware()
     set_app_user_model_id("cc-light.NotePad")   # 独立 AppID:任务栏按它缓存图标,不再沿用 pythonw 的 python 图标
 
-    W, H = 52, 150
+    W, H = 60, 150
     R_LAMP = 12
-    R_GLOW = 16
     cx = W // 2
-    cy_l = [29, 65, 101]
+    cy_l = [31, 72, 108]
     PAD = 3
-    R_BACK = 12
+    R_BACK = 13
 
     root = tk.Tk()
     root.overrideredirect(True)
@@ -2951,36 +2950,46 @@ def _run_gui():
     cv = tk.Canvas(root, width=W, height=H, bg=MAGIC, highlightthickness=0, bd=0)
     cv.pack()
 
-    round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK, fill=BG, outline=BORDER, width=1)
+    round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK,
+               fill="#1c202a", outline="#39424d", width=1)
 
+    # 暗面、亮面、细亮圈及其底色。
+    lamp_palette = {
+        "red": ("#40252b", "#f25459", "#ff7775", "#51292e"),
+        "yellow": ("#46381b", "#f2ac3c", "#ffc66a", "#4d3c24"),
+        "green": ("#23382d", "#3fc561", "#53d97d", "#21432f"),
+    }
     lamps = {}
     for i, key in enumerate(ORDER):
-        glow = cv.create_oval(cx - R_GLOW, cy_l[i] - R_GLOW, cx + R_GLOW, cy_l[i] + R_GLOW,
-                              fill=COLORS[key]["on"], outline="", stipple="gray50", state="hidden")
-        base = cv.create_oval(cx - R_LAMP, cy_l[i] - R_LAMP, cx + R_LAMP, cy_l[i] + R_LAMP,
-                              fill=COLORS[key]["dim"], outline="#2a2a2a", width=1)
-        hi = cv.create_oval(cx - R_LAMP + 3, cy_l[i] - R_LAMP + 2, cx - 3, cy_l[i] - R_LAMP + 8,
-                            fill="#ffffff", outline="", state="hidden")
-        lamps[key] = {"base": base, "glow": glow, "hi": hi}
+        dim, _, rim, halo = lamp_palette[key]
+        y = cy_l[i]
+        lit_tag = "lamp_lit_" + key
+        cv.create_oval(cx - 16, y - 16, cx + 16, y + 16, fill=halo, outline=halo,
+                       width=3, tags=lit_tag, state="hidden")
+        cv.create_oval(cx - 15, y - 15, cx + 15, y + 15, outline=rim, width=2,
+                       tags=lit_tag, state="hidden")
+        base = cv.create_oval(cx - R_LAMP, y - R_LAMP, cx + R_LAMP, y + R_LAMP,
+                              fill=dim, outline="")
+        cv.create_oval(cx - 7, y - 8, cx - 2, y - 3, fill="#f4fcfa", outline="",
+                       tags=lit_tag, state="hidden")
+        lamps[key] = {"base": base, "lit": lit_tag}
 
     dots = []   # 横排小点 item ids(每个会话一个,颜色=该会话有效状态)
     cur = {"s": None, "pulse": False}
     red_y = cy_l[ORDER.index("red")]
-    ring_radius = 17
-    # 从十二点方向顺时针画进度，每个坐标对应 1%。
-    ring_points = [
-        (cx + ring_radius * math.sin(math.tau * i / 100),
-         red_y - ring_radius * math.cos(math.tau * i / 100))
-        for i in range(101)
-    ]
-    cv.create_oval(cx - ring_radius, red_y - ring_radius, cx + ring_radius, red_y + ring_radius,
-                   fill="#252329", outline="#593e40", width=3, tags="memory", state="hidden")
-    memory_glow = cv.create_line(*ring_points[:2], width=8, capstyle="round", joinstyle="round",
+    orbit_radius = 20
+    orbit_box = (cx - orbit_radius, red_y - orbit_radius, cx + orbit_radius, red_y + orbit_radius)
+    cv.create_oval(*orbit_box, fill="#1b1e25", outline="#41454e", tags="memory", state="hidden")
+    marker_tags = ("memory", "memory_marker")
+    tail = cv.create_arc(*orbit_box, style="arc", extent=32, width=1,
+                         tags=marker_tags, state="hidden")
+    marker_halo = cv.create_oval(0, 0, 0, 0, outline="", tags=marker_tags, state="hidden")
+    marker = cv.create_oval(0, 0, 0, 0, width=1, tags=marker_tags, state="hidden")
+    number_font = _tkfont.Font(root=root, family="Segoe UI", size=-15, weight="bold")
+    unit_font = _tkfont.Font(root=root, family="Segoe UI", size=-8)
+    memory_text = cv.create_text(cx, red_y, anchor="w", font=number_font, tags="memory", state="hidden")
+    memory_unit = cv.create_text(cx, red_y + 2, anchor="w", text="%", font=unit_font,
                                  tags="memory", state="hidden")
-    memory_ring = cv.create_line(*ring_points[:2], width=4, capstyle="round", joinstyle="round",
-                                 tags="memory", state="hidden")
-    memory_text = cv.create_text(cx, red_y, text="--%", fill="#777777",
-                                 font=("Consolas", -12, "bold"), tags="memory", state="hidden")
 
     def render_memory():
         if cur["s"] == "red" or not _config.get("show_memory", True):
@@ -2988,17 +2997,27 @@ def _run_gui():
             return
         percent = read_memory_percent()
         text, color = memory_display(percent)
-        cv.itemconfig(memory_text, text=text, fill=color)
+        number = text[:-1]
+        number_width = number_font.measure(number)
+        left = cx - (number_width + 1 + unit_font.measure("%")) / 2
+        cv.coords(memory_text, left, red_y)
+        cv.coords(memory_unit, left + number_width + 1, red_y + 2)
+        cv.itemconfig(memory_text, text=number, fill=color)
+        cv.itemconfig(memory_unit, fill="#9da1aa" if percent is not None and percent <= 90 else color)
         cv.itemconfig("memory", state="normal")
-        if not percent:
-            cv.itemconfig(memory_ring, state="hidden")
-            cv.itemconfig(memory_glow, state="hidden")
+        if percent is None:
+            cv.itemconfig("memory_marker", state="hidden")
             return
-        points = [coordinate for point in ring_points[:percent + 1] for coordinate in point]
-        cv.coords(memory_glow, *points)
-        cv.coords(memory_ring, *points)
-        cv.itemconfig(memory_glow, fill="#872e36" if percent > 90 else "#5c3034")
-        cv.itemconfig(memory_ring, fill=color if percent > 90 else "#ff7970")
+        # 沿轨道顺时针移动，77% 时光点位于右上方。
+        angle = -45 - 360 * percent / 100
+        x = cx + orbit_radius * math.cos(math.radians(angle))
+        y = red_y - orbit_radius * math.sin(math.radians(angle))
+        alert = percent > 90
+        cv.itemconfig(tail, start=angle, outline="#b14a53" if alert else "#8c605b")
+        cv.coords(marker_halo, x - 4, y - 4, x + 4, y + 4)
+        cv.itemconfig(marker_halo, fill="#722c38" if alert else "#67413d")
+        cv.coords(marker, x - 2.5, y - 2.5, x + 2.5, y + 2.5)
+        cv.itemconfig(marker, fill=color if alert else "#ffd8bc", outline=color if alert else "#ffa88b")
 
     def refresh_memory():
         render_memory()
@@ -3008,12 +3027,9 @@ def _run_gui():
         cur["pulse"] = False
         for key, L in lamps.items():
             on = (state == key)
-            cv.itemconfig(L["base"],
-                          fill=COLORS[key]["on"] if on else COLORS[key]["dim"],
-                          outline="#000000" if on else "#2a2a2a",
-                          width=2 if on else 1)
-            cv.itemconfig(L["glow"], state="normal" if on else "hidden")
-            cv.itemconfig(L["hi"], state="normal" if on else "hidden")
+            dim, bright, _, _ = lamp_palette[key]
+            cv.itemconfig(L["base"], fill=bright if on else dim)
+            cv.itemconfig(L["lit"], state="normal" if on else "hidden")
         render_memory()
         if state == "yellow":
             start_pulse()
@@ -3026,9 +3042,8 @@ def _run_gui():
         def tick(bright):
             if not cur["pulse"] or cur["s"] != "yellow":
                 return
-            cv.itemconfig(lamps["yellow"]["base"],
-                          fill=COLORS["yellow"]["on"] if bright else COLORS["yellow"]["mid"])
-            cv.itemconfig(lamps["yellow"]["glow"], state="normal" if bright else "hidden")
+            yellow = lamps["yellow"]
+            cv.itemconfig(yellow["base"], fill=lamp_palette["yellow"][1] if bright else "#bd8532")
             root.after(650, lambda: tick(not bright))
         tick(False)
 
@@ -3053,11 +3068,12 @@ def _run_gui():
         r = min(3.0, max(1.8, (avail - (n - 1) * gap) / (2.5 * n)))   # 点多则更小,5个不挤
         total = n * 2 * r + (n - 1) * gap
         x = (W - total) / 2 + r
-        y = 126
+        y = 133
         for (sid, d) in items:
             st = effective_state(d, now)
-            color = COLORS.get(st, {}).get("on", "#666666")
-            dots.append(cv.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=""))
+            color = lamp_palette[st][1] if st in lamp_palette else "#666666"
+            dots.append(cv.create_oval(x - r, y - r, x + r, y + r,
+                                       fill=color, outline="#252e33", width=1))
             x += 2 * r + gap
 
     heal_counter = [0]
