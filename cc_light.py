@@ -55,7 +55,8 @@ DSH_ACTIVE_WINDOW = 3600    # 空闲会话 1h 未更新后不再展示(忙碌中
 DSH_ARCHIVED_FILE = os.path.join(DATA_DIR, "dsh-archived.json")
 _DSH_CACHE = {"checked": 0, "sessions": {}}
 DEFAULT_CONFIG = {"yellow_timeout": 30, "timeout_fallback": True,   # 默认 30 秒(PostToolUse 心跳刷 ts,中断/卡住 30s 降绿)
-                  "monitor_claude": True, "monitor_codex": True, "monitor_dsh": True}   # 监测范围(右键可勾选)
+                  "monitor_claude": True, "monitor_codex": True, "monitor_dsh": True,
+                  "show_memory": True}   # 监测范围及内存显示(右键可勾选)
 ERROR_LOG = os.path.join(DATA_DIR, "error.log")          # 异常日志(右键「错误日志」查看,复制丢给排查)
 MAX_ERROR_LOG = 200   # 异常日志保留最近 N 条(超 500KB 自动截断)
 ORDER_FILE = os.path.join(DATA_DIR, "order.json")   # 用户拖拽排序的会话顺序 [sid,...]
@@ -2828,7 +2829,7 @@ def _run_gui():
     set_dpi_aware()
     set_app_user_model_id("cc-light.NotePad")   # 独立 AppID:任务栏按它缓存图标,不再沿用 pythonw 的 python 图标
 
-    W, H = 52, 174
+    W, H = 52, 174 if _config.get("show_memory", True) else 150
     R_LAMP = 12
     R_GLOW = 16
     cx = W // 2
@@ -2950,7 +2951,7 @@ def _run_gui():
     cv = tk.Canvas(root, width=W, height=H, bg=MAGIC, highlightthickness=0, bd=0)
     cv.pack()
 
-    round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK, fill=BG, outline=BORDER, width=1)
+    background = round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK, fill=BG, outline=BORDER, width=1)
 
     lamps = {}
     for i, key in enumerate(ORDER):
@@ -2966,9 +2967,15 @@ def _run_gui():
     memory_text = cv.create_text(cx, 153, text="--%", fill="#777777",
                                  font=("Consolas", 12, "bold"), tags="memory")
 
+    def render_memory():
+        if _config.get("show_memory", True):
+            text, color = memory_display(read_memory_percent())
+            cv.itemconfig(memory_text, text=text, fill=color, state="normal")
+        else:
+            cv.itemconfig(memory_text, state="hidden")
+
     def refresh_memory():
-        text, color = memory_display(read_memory_percent())
-        cv.itemconfig(memory_text, text=text, fill=color)
+        render_memory()
         root.after(1000, refresh_memory)
 
     refresh_memory()
@@ -3499,6 +3506,22 @@ def _run_gui():
 
     fallback_var = tk.IntVar(value=1 if _config["timeout_fallback"] else 0)
     timeout_var = tk.IntVar(value=_config["yellow_timeout"])
+    memory_var = tk.IntVar(value=1 if _config.get("show_memory", True) else 0)
+
+    def on_toggle_memory():
+        nonlocal H, background
+        _config["show_memory"] = bool(memory_var.get())
+        save_config()
+        H = 174 if _config["show_memory"] else 150
+        x, y = visible_position(root.winfo_x(), root.winfo_y(), W, H, monitor_work_areas())
+        root.geometry("%dx%d+%d+%d" % (W, H, x, y))
+        cv.configure(height=H)
+        cv.delete(background)
+        background = round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK,
+                                fill=BG, outline=BORDER, width=1)
+        cv.tag_lower(background)
+        render_memory()
+        save_pos()
 
     def on_toggle_fallback():
         _config["timeout_fallback"] = bool(fallback_var.get())
@@ -4296,6 +4319,7 @@ def _run_gui():
 
     # 「其他设置」二级菜单:超时兜底 / 超时时间 / 监测范围(可勾选,关掉某类会话不再统计)
     other_menu = tk.Menu(root, tearoff=0)
+    other_menu.add_checkbutton(label="显示内存", variable=memory_var, command=on_toggle_memory)
     other_menu.add_checkbutton(label="超时兜底", variable=fallback_var, command=on_toggle_fallback)
     other_menu.add_cascade(label="超时时间", menu=timeout_menu)
     other_menu.add_cascade(label="监测范围", menu=monitor_menu)
