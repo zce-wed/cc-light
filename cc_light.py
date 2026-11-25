@@ -2964,32 +2964,48 @@ def _run_gui():
         lamps[key] = {"base": base, "glow": glow, "hi": hi}
 
     dots = []   # 横排小点 item ids(每个会话一个,颜色=该会话有效状态)
-    # 内存数字始终有深色灯芯衬底；灯圈单独表示是否有会话等确认。
+    cur = {"s": None, "pulse": False}
     red_y = cy_l[ORDER.index("red")]
-    memory_face = cv.create_oval(cx - 17, red_y - 17, cx + 17, red_y + 17,
-                                 fill=COLORS["red"]["dim"], outline="#502426", width=3, tags="memory")
+    ring_radius = 17
+    # 从十二点方向顺时针画进度，每个坐标对应 1%。
+    ring_points = [
+        (cx + ring_radius * math.sin(math.tau * i / 100),
+         red_y - ring_radius * math.cos(math.tau * i / 100))
+        for i in range(101)
+    ]
+    cv.create_oval(cx - ring_radius, red_y - ring_radius, cx + ring_radius, red_y + ring_radius,
+                   fill="#252329", outline="#593e40", width=3, tags="memory", state="hidden")
+    memory_glow = cv.create_line(*ring_points[:2], width=8, capstyle="round", joinstyle="round",
+                                 tags="memory", state="hidden")
+    memory_ring = cv.create_line(*ring_points[:2], width=4, capstyle="round", joinstyle="round",
+                                 tags="memory", state="hidden")
     memory_text = cv.create_text(cx, red_y, text="--%", fill="#777777",
-                                 font=("Consolas", -12, "bold"), tags="memory")
+                                 font=("Consolas", -12, "bold"), tags="memory", state="hidden")
 
     def render_memory():
-        if not _config.get("show_memory", True):
+        if cur["s"] == "red" or not _config.get("show_memory", True):
             cv.itemconfig("memory", state="hidden")
             return
-        text, color = memory_display(read_memory_percent())
+        percent = read_memory_percent()
+        text, color = memory_display(percent)
         cv.itemconfig(memory_text, text=text, fill=color)
         cv.itemconfig("memory", state="normal")
+        if not percent:
+            cv.itemconfig(memory_ring, state="hidden")
+            cv.itemconfig(memory_glow, state="hidden")
+            return
+        points = [coordinate for point in ring_points[:percent + 1] for coordinate in point]
+        cv.coords(memory_glow, *points)
+        cv.coords(memory_ring, *points)
+        cv.itemconfig(memory_glow, fill="#872e36" if percent > 90 else "#5c3034")
+        cv.itemconfig(memory_ring, fill=color if percent > 90 else "#ff7970")
 
     def refresh_memory():
         render_memory()
         root.after(1000, refresh_memory)
 
-    refresh_memory()
-
-    cur = {"s": None, "pulse": False}
-
     def paint(state):
         cur["pulse"] = False
-        cv.itemconfig(memory_face, outline=COLORS["red"]["on"] if state == "red" else "#502426")
         for key, L in lamps.items():
             on = (state == key)
             cv.itemconfig(L["base"],
@@ -2998,6 +3014,7 @@ def _run_gui():
                           width=2 if on else 1)
             cv.itemconfig(L["glow"], state="normal" if on else "hidden")
             cv.itemconfig(L["hi"], state="normal" if on else "hidden")
+        render_memory()
         if state == "yellow":
             start_pulse()
 
@@ -4505,6 +4522,7 @@ def _run_gui():
     # render so a restart cannot resurrect a terminal that was closed.
     restore_sessions()
     poll()
+    root.after(1000, refresh_memory)
     root.mainloop()
 
 
