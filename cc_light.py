@@ -2829,7 +2829,7 @@ def _run_gui():
     set_dpi_aware()
     set_app_user_model_id("cc-light.NotePad")   # 独立 AppID:任务栏按它缓存图标,不再沿用 pythonw 的 python 图标
 
-    W, H = 52, 174 if _config.get("show_memory", True) else 150
+    W, H = 52, 150
     R_LAMP = 12
     R_GLOW = 16
     cx = W // 2
@@ -2951,7 +2951,7 @@ def _run_gui():
     cv = tk.Canvas(root, width=W, height=H, bg=MAGIC, highlightthickness=0, bd=0)
     cv.pack()
 
-    background = round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK, fill=BG, outline=BORDER, width=1)
+    round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK, fill=BG, outline=BORDER, width=1)
 
     lamps = {}
     for i, key in enumerate(ORDER):
@@ -2964,15 +2964,20 @@ def _run_gui():
         lamps[key] = {"base": base, "glow": glow, "hi": hi}
 
     dots = []   # 横排小点 item ids(每个会话一个,颜色=该会话有效状态)
-    memory_text = cv.create_text(cx, 153, text="--%", fill="#777777",
-                                 font=("Consolas", 12, "bold"), tags="memory")
+    # 内存数字始终有深色灯芯衬底；灯圈单独表示是否有会话等确认。
+    red_y = cy_l[ORDER.index("red")]
+    memory_face = cv.create_oval(cx - 17, red_y - 17, cx + 17, red_y + 17,
+                                 fill=COLORS["red"]["dim"], outline="#502426", width=3, tags="memory")
+    memory_text = cv.create_text(cx, red_y, text="--%", fill="#777777",
+                                 font=("Consolas", -12, "bold"), tags="memory")
 
     def render_memory():
-        if _config.get("show_memory", True):
-            text, color = memory_display(read_memory_percent())
-            cv.itemconfig(memory_text, text=text, fill=color, state="normal")
-        else:
-            cv.itemconfig(memory_text, state="hidden")
+        if not _config.get("show_memory", True):
+            cv.itemconfig("memory", state="hidden")
+            return
+        text, color = memory_display(read_memory_percent())
+        cv.itemconfig(memory_text, text=text, fill=color)
+        cv.itemconfig("memory", state="normal")
 
     def refresh_memory():
         render_memory()
@@ -2984,6 +2989,7 @@ def _run_gui():
 
     def paint(state):
         cur["pulse"] = False
+        cv.itemconfig(memory_face, outline=COLORS["red"]["on"] if state == "red" else "#502426")
         for key, L in lamps.items():
             on = (state == key)
             cv.itemconfig(L["base"],
@@ -3509,19 +3515,9 @@ def _run_gui():
     memory_var = tk.IntVar(value=1 if _config.get("show_memory", True) else 0)
 
     def on_toggle_memory():
-        nonlocal H, background
         _config["show_memory"] = bool(memory_var.get())
         save_config()
-        H = 174 if _config["show_memory"] else 150
-        x, y = visible_position(root.winfo_x(), root.winfo_y(), W, H, monitor_work_areas())
-        root.geometry("%dx%d+%d+%d" % (W, H, x, y))
-        cv.configure(height=H)
-        cv.delete(background)
-        background = round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK,
-                                fill=BG, outline=BORDER, width=1)
-        cv.tag_lower(background)
         render_memory()
-        save_pos()
 
     def on_toggle_fallback():
         _config["timeout_fallback"] = bool(fallback_var.get())
