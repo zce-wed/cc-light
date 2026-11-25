@@ -17,8 +17,8 @@ import os
 import re
 import json
 import time
-import math
 from codex_wait import update_rollout as _update_codex_wait, permission_state as _codex_permission_state
+from widget_art import WIDTH, HEIGHT, memory_display, render_widget
 from datetime import datetime
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,12 +103,10 @@ COLORS = {
     "yellow": {"on": "#f5a623", "dim": "#3a2e0e", "mid": "#9c6510"},
     "green":  {"on": "#34d058", "dim": "#0e3a1c"},
 }
-ORDER = ["red", "yellow", "green"]
 PRIO = {"red": 0, "yellow": 1, "green": 2}
 STATE_WORD = {"red": "等确认", "yellow": "运行中", "green": "完成", "gray": "待机"}
 BG = "#161618"
 BORDER = "#34343a"
-MAGIC = "#010109"   # 透明色(不能与任何可见色相同)
 
 
 def ensure_dir():
@@ -2768,24 +2766,6 @@ def is_session_alive(d):
     return bool(resolve_hwnd(d.get("hwnd"), d.get("name")))
 
 
-def round_rect(cv, x0, y0, x1, y1, r, **kw):
-    """tkinter 圆角矩形(create_polygon 折线近似)"""
-    pts = []
-    steps = 5
-    corners = [
-        (x0 + r, y0 + r, 180, 270),   # 左上
-        (x1 - r, y0 + r, 270, 360),   # 右上
-        (x1 - r, y1 - r, 0,   90),    # 右下
-        (x0 + r, y1 - r, 90,  180),   # 左下
-    ]
-    for (cx, cy, a0, a1) in corners:
-        for i in range(steps + 1):
-            ang = a0 + (a1 - a0) * i / steps
-            pts.append(cx + r * math.cos(math.radians(ang)))
-            pts.append(cy + r * math.sin(math.radians(ang)))
-    return cv.create_polygon(pts, **kw)
-
-
 # ---------------- GUI ----------------
 def read_memory_percent():
     """Read system-wide physical RAM usage with Windows' native API."""
@@ -2809,12 +2789,6 @@ def read_memory_percent():
     return None
 
 
-def memory_display(percent):
-    if percent is None:
-        return "--%", "#777777"
-    return "%d%%" % percent, COLORS["red"]["on"] if percent > 90 else "#ededed"
-
-
 def run_gui():
     if not _acquire_gui_instance():
         return 0
@@ -2829,25 +2803,13 @@ def _run_gui():
     set_dpi_aware()
     set_app_user_model_id("cc-light.NotePad")   # 独立 AppID:任务栏按它缓存图标,不再沿用 pythonw 的 python 图标
 
-    W, H = 60, 150
-    R_LAMP = 12
-    cx = W // 2
-    cy_l = [31, 72, 108]
-    PAD = 3
-    R_BACK = 13
+    W, H = WIDTH, HEIGHT
 
     root = tk.Tk()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.configure(bg=MAGIC)
-    try:
-        root.wm_attributes("-transparentcolor", MAGIC)   # 圆角悬浮:窗口方角透明
-    except Exception:
-        pass
-    try:
-        root.attributes("-alpha", 0.96)
-    except Exception:
-        pass
+    root.withdraw()
+    root.configure(bg="#1c202a")
 
     # 全局兜底:GUI 回调里的未处理异常一律记日志(pythonw 下 stderr 看不到,只能靠它)
     def _on_gui_exception(exc, val, tb):
@@ -2947,142 +2909,71 @@ def _run_gui():
     except Exception:
         root.geometry(default_geo())
 
-    cv = tk.Canvas(root, width=W, height=H, bg=MAGIC, highlightthickness=0, bd=0)
+    from widget_window import TkBitmap, LayeredWindow
+    cv = tk.Canvas(root, width=W, height=H, bg="#1c202a", highlightthickness=0, bd=0)
     cv.pack()
+    surface = LayeredWindow(root, W, H) if sys.platform == "win32" else TkBitmap(cv, W, H)
+    state = None
+    dot_states = ()
+    percent = None
+    pulse_bright = False
+    pulse_timer = None
+    last_frame = None
 
-    round_rect(cv, PAD, PAD, W - PAD, H - PAD, R_BACK,
-               fill="#1c202a", outline="#39424d", width=1)
-
-    # 暗面、亮面、细亮圈及其底色。
-    lamp_palette = {
-        "red": ("#40252b", "#f25459", "#ff7775", "#51292e"),
-        "yellow": ("#46381b", "#f2ac3c", "#ffc66a", "#4d3c24"),
-        "green": ("#23382d", "#3fc561", "#53d97d", "#21432f"),
-    }
-    lamps = {}
-    for i, key in enumerate(ORDER):
-        dim, _, rim, halo = lamp_palette[key]
-        y = cy_l[i]
-        lit_tag = "lamp_lit_" + key
-        cv.create_oval(cx - 16, y - 16, cx + 16, y + 16, fill=halo, outline=halo,
-                       width=3, tags=lit_tag, state="hidden")
-        cv.create_oval(cx - 15, y - 15, cx + 15, y + 15, outline=rim, width=2,
-                       tags=lit_tag, state="hidden")
-        base = cv.create_oval(cx - R_LAMP, y - R_LAMP, cx + R_LAMP, y + R_LAMP,
-                              fill=dim, outline="")
-        cv.create_oval(cx - 7, y - 8, cx - 2, y - 3, fill="#f4fcfa", outline="",
-                       tags=lit_tag, state="hidden")
-        lamps[key] = {"base": base, "lit": lit_tag}
-
-    dots = []   # 横排小点 item ids(每个会话一个,颜色=该会话有效状态)
-    cur = {"s": None, "pulse": False}
-    red_y = cy_l[ORDER.index("red")]
-    orbit_radius = 20
-    orbit_box = (cx - orbit_radius, red_y - orbit_radius, cx + orbit_radius, red_y + orbit_radius)
-    cv.create_oval(*orbit_box, fill="#1b1e25", outline="#41454e", tags="memory", state="hidden")
-    marker_tags = ("memory", "memory_marker")
-    tail = cv.create_arc(*orbit_box, style="arc", extent=32, width=1,
-                         tags=marker_tags, state="hidden")
-    marker_halo = cv.create_oval(0, 0, 0, 0, outline="", tags=marker_tags, state="hidden")
-    marker = cv.create_oval(0, 0, 0, 0, width=1, tags=marker_tags, state="hidden")
-    number_font = _tkfont.Font(root=root, family="Segoe UI", size=-15, weight="bold")
-    unit_font = _tkfont.Font(root=root, family="Segoe UI", size=-8)
-    memory_text = cv.create_text(cx, red_y, anchor="w", font=number_font, tags="memory", state="hidden")
-    memory_unit = cv.create_text(cx, red_y + 2, anchor="w", text="%", font=unit_font,
-                                 tags="memory", state="hidden")
-
-    def render_memory():
-        if cur["s"] == "red" or not _config.get("show_memory", True):
-            cv.itemconfig("memory", state="hidden")
+    def redraw(force=False):
+        nonlocal last_frame, surface
+        if state is None:
             return
-        percent = read_memory_percent()
-        text, color = memory_display(percent)
-        number = text[:-1]
-        number_width = number_font.measure(number)
-        left = cx - (number_width + 1 + unit_font.measure("%")) / 2
-        cv.coords(memory_text, left, red_y)
-        cv.coords(memory_unit, left + number_width + 1, red_y + 2)
-        cv.itemconfig(memory_text, text=number, fill=color)
-        cv.itemconfig(memory_unit, fill="#9da1aa" if percent is not None and percent <= 90 else color)
-        cv.itemconfig("memory", state="normal")
-        if percent is None:
-            cv.itemconfig("memory_marker", state="hidden")
-            return
-        # 沿轨道顺时针移动，77% 时光点位于右上方。
-        angle = -45 - 360 * percent / 100
-        x = cx + orbit_radius * math.cos(math.radians(angle))
-        y = red_y - orbit_radius * math.sin(math.radians(angle))
-        alert = percent > 90
-        cv.itemconfig(tail, start=angle, outline="#b14a53" if alert else "#8c605b")
-        cv.coords(marker_halo, x - 4, y - 4, x + 4, y + 4)
-        cv.itemconfig(marker_halo, fill="#722c38" if alert else "#67413d")
-        cv.coords(marker, x - 2.5, y - 2.5, x + 2.5, y + 2.5)
-        cv.itemconfig(marker, fill=color if alert else "#ffd8bc", outline=color if alert else "#ffa88b")
+        show_memory = _config.get("show_memory", True) and state != "red"
+        frame_key = (state, pulse_bright, show_memory, percent if show_memory else None, dot_states)
+        if force or frame_key != last_frame:
+            pixels = render_widget(*frame_key)
+            try:
+                surface.present(pixels)
+            except OSError as exc:
+                log_error(exc, "UpdateLayeredWindow")
+                surface = TkBitmap(cv, W, H)
+                surface.present(pixels)
+            last_frame = frame_key
+
+    def sample_memory():
+        nonlocal percent
+        if _config.get("show_memory", True) and state != "red":
+            percent = read_memory_percent()
 
     def refresh_memory():
-        render_memory()
+        sample_memory()
+        redraw()
         root.after(1000, refresh_memory)
 
-    def paint(state):
-        cur["pulse"] = False
-        for key, L in lamps.items():
-            on = (state == key)
-            dim, bright, _, _ = lamp_palette[key]
-            cv.itemconfig(L["base"], fill=bright if on else dim)
-            cv.itemconfig(L["lit"], state="normal" if on else "hidden")
-        render_memory()
-        if state == "yellow":
-            start_pulse()
+    def pulse():
+        nonlocal pulse_bright, pulse_timer
+        pulse_bright = not pulse_bright
+        redraw()
+        pulse_timer = root.after(650, pulse)
 
-    def start_pulse():
-        if cur["pulse"]:
-            return
-        cur["pulse"] = True
-
-        def tick(bright):
-            if not cur["pulse"] or cur["s"] != "yellow":
-                return
-            yellow = lamps["yellow"]
-            cv.itemconfig(yellow["base"], fill=lamp_palette["yellow"][1] if bright else "#bd8532")
-            root.after(650, lambda: tick(not bright))
-        tick(False)
-
-    def apply(state):
-        if state not in COLORS:
-            state = "gray"
-        if state != cur["s"]:
-            cur["s"] = state
-            paint(state)
-
-    def render_dots(sessions, now):
-        for it in dots:
-            cv.delete(it)
-        dots.clear()
-        if not sessions:
-            return
-        items = sorted(sessions.items(),
-                       key=lambda kv: (PRIO.get(effective_state(kv[1], now), 99), -kv[1].get("ts", 0)))
-        n = len(items)
-        gap = 2.5
-        avail = W - 2 * PAD - 2
-        r = min(3.0, max(1.8, (avail - (n - 1) * gap) / (2.5 * n)))   # 点多则更小,5个不挤
-        total = n * 2 * r + (n - 1) * gap
-        x = (W - total) / 2 + r
-        y = 133
-        for (sid, d) in items:
-            st = effective_state(d, now)
-            color = lamp_palette[st][1] if st in lamp_palette else "#666666"
-            dots.append(cv.create_oval(x - r, y - r, x + r, y + r,
-                                       fill=color, outline="#252e33", width=1))
-            x += 2 * r + gap
+    def update_lights(sessions):
+        nonlocal state, dot_states, pulse_bright, pulse_timer
+        now = time.time()
+        ordered = sorted(sessions.values(), key=lambda d: (
+            PRIO.get(effective_state(d, now), 99), -d.get("ts", 0)))
+        dot_states = tuple(effective_state(d, now) for d in ordered)
+        new_state, _ = aggregate(sessions)
+        if new_state != state:
+            previous_state, state = state, new_state
+            if pulse_timer is not None:
+                root.after_cancel(pulse_timer)
+                pulse_timer = None
+            pulse_bright = state == "yellow"
+            if pulse_bright:
+                pulse_timer = root.after(650, pulse)
+            if previous_state in (None, "red"):
+                sample_memory()
+        redraw()
 
     heal_counter = [0]
     def poll():
-        sessions = read_sessions()
-        now = time.time()
-        c, n = aggregate(sessions)
-        apply(c)
-        render_dots(sessions, now)
+        update_lights(read_sessions())
         heal_counter[0] += 1
         if heal_counter[0] % 40 == 0:   # 40 × 500ms = 20s,定期自愈
             ensure_hooks()
@@ -3420,10 +3311,7 @@ def _run_gui():
     def keep_working():
         keep_working_sessions()
         close_details()
-        sessions = read_sessions()
-        c, n = aggregate(sessions)
-        apply(c)
-        render_dots(sessions, time.time())
+        update_lights(read_sessions())
 
     def cleanup_stale():
         """归档超过超时阈值无更新的会话(归档而非真删,可用「检测所有会话」还原)。
@@ -3454,10 +3342,7 @@ def _run_gui():
                         pass
                     continue
                 archive_session(sid)
-        sessions = read_sessions()
-        c, n = aggregate(sessions)
-        apply(c)
-        render_dots(sessions, time.time())
+        update_lights(read_sessions())
 
     def restore_sessions():
         if _config.get("monitor_codex", True):   # 监测范围关掉 Codex 时不扫(下面 read_sessions 也会过滤)
@@ -3538,10 +3423,7 @@ def _run_gui():
                 os.remove(src)
             except Exception:
                 pass
-        sessions = read_sessions()
-        c, n = aggregate(sessions)
-        apply(c)
-        render_dots(sessions, time.time())
+        update_lights(read_sessions())
 
     fallback_var = tk.IntVar(value=1 if _config["timeout_fallback"] else 0)
     timeout_var = tk.IntVar(value=_config["yellow_timeout"])
@@ -3550,7 +3432,8 @@ def _run_gui():
     def on_toggle_memory():
         _config["show_memory"] = bool(memory_var.get())
         save_config()
-        render_memory()
+        sample_memory()
+        redraw()
 
     def on_toggle_fallback():
         _config["timeout_fallback"] = bool(fallback_var.get())
@@ -3575,10 +3458,7 @@ def _run_gui():
     def on_toggle_monitor(key):
         _config["monitor_" + key] = bool(monitor_vars[key].get())
         save_config()
-        sessions = read_sessions()
-        c, n = aggregate(sessions)
-        apply(c)
-        render_dots(sessions, time.time())
+        update_lights(read_sessions())
 
     monitor_menu = tk.Menu(root, tearoff=0)
     for key, label in (("claude", "Claude Code"), ("codex", "Codex"), ("dsh", "DeepSeek Harness")):
@@ -3589,6 +3469,7 @@ def _run_gui():
 
     def on_toggle_topmost():
         root.attributes("-topmost", bool(topmost_var.get()))
+        redraw(force=True)
 
     # ---------------- 快捷记录:悬浮便签 + 历史 ----------------
     note_win = [None]          # 当前便签 Toplevel(单例;已开则前置聚焦)
@@ -4537,6 +4418,9 @@ def _run_gui():
     # Scanned sessions have no SessionEnd hook. Reconcile them before the first
     # render so a restart cannot resurrect a terminal that was closed.
     restore_sessions()
+    root.deiconify()
+    root.update_idletasks()
+    redraw(force=True)
     poll()
     root.after(1000, refresh_memory)
     root.mainloop()

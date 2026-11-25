@@ -113,4 +113,4 @@ python install-hooks.py uninstall   # 移除 hooks(自动备份)
 
 ## 平台
 
-Windows 11 + Python 3.8 + Node.js。圆角悬浮用 `-transparentcolor`,复位用 Win32 workarea API + DPI aware。
+Windows 11 + Python 3.8 + Node.js。悬浮灯尺寸为 52 × 150 像素。Windows 按逐像素透明度将圆角和桌面合成，灯面使用渐变和柔和反光。窗口复位使用 Win32 工作区坐标。
